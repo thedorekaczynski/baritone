@@ -60,6 +60,7 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
     private BlockPos branchPoint;
     private GoalRunAway branchPointRunaway;
     private int desiredQuantity;
+    private boolean collectDrops;
     private int tickCount;
 
     public MineProcess(Baritone baritone) {
@@ -102,6 +103,11 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         }
 
         updateLoucaSystem();
+        List<BlockPos> dropped = droppedItemsScan();
+        if (collectDrops && !dropped.isEmpty()) {
+            Goal droppedGoal = new GoalComposite(dropped.stream().map(GoalBlock::new).toArray(Goal[]::new));
+            return new PathingCommand(droppedGoal, PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH);
+        }
         int mineGoalUpdateInterval = Baritone.settings().mineGoalUpdateInterval.value;
         List<BlockPos> curr = new ArrayList<>(knownOreLocations);
         if (mineGoalUpdateInterval != 0 && tickCount++ % mineGoalUpdateInterval == 0) { // big brain
@@ -504,11 +510,21 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
 
     @Override
     public void mine(int quantity, BlockOptionalMetaLookup filter) {
+        mine(quantity, filter, false);
+    }
+
+    @Override
+    public void mineAndCollect(int quantity, BlockOptionalMetaLookup filter) {
+        mine(quantity, filter, true);
+    }
+
+    private void mine(int quantity, BlockOptionalMetaLookup filter, boolean collectDrops) {
         this.filter = filter;
         if (this.filterFilter() == null) {
             this.filter = null;
         }
         this.desiredQuantity = quantity;
+        this.collectDrops = collectDrops;
         this.knownOreLocations = new ArrayList<>();
         this.blacklist = new ArrayList<>();
         this.branchPoint = null;

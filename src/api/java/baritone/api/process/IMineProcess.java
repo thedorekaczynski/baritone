@@ -49,12 +49,25 @@ public interface IMineProcess extends IBaritoneProcess {
     void mine(int quantity, BlockOptionalMetaLookup filter);
 
     /**
+     * Begin to search for and mine the specified blocks, explicitly prioritizing collection of matching dropped items
+     * before continuing to mine more blocks.
+     *
+     * @param quantity The total number of items to get
+     * @param filter   The blocks to mine
+     */
+    void mineAndCollect(int quantity, BlockOptionalMetaLookup filter);
+
+    /**
      * Begin to search for and mine the specified blocks.
      *
      * @param filter The blocks to mine
      */
     default void mine(BlockOptionalMetaLookup filter) {
         mine(0, filter);
+    }
+
+    default void mineAndCollect(BlockOptionalMetaLookup filter) {
+        mineAndCollect(0, filter);
     }
 
     /**
@@ -75,6 +88,10 @@ public interface IMineProcess extends IBaritoneProcess {
         mine(quantity, new BlockOptionalMetaLookup(boms));
     }
 
+    default void mineAndCollect(int quantity, BlockOptionalMeta... boms) {
+        mineAndCollect(quantity, new BlockOptionalMetaLookup(boms));
+    }
+
     /**
      * Begin to search for and mine the specified blocks.
      *
@@ -82,6 +99,10 @@ public interface IMineProcess extends IBaritoneProcess {
      */
     default void mine(BlockOptionalMeta... boms) {
         mine(0, boms);
+    }
+
+    default void mineAndCollect(BlockOptionalMeta... boms) {
+        mineAndCollect(0, boms);
     }
 
     /**
@@ -98,6 +119,14 @@ public interface IMineProcess extends IBaritoneProcess {
         ));
     }
 
+    default void mineAndCollect(int quantity, Block... blocks) {
+        mineAndCollect(quantity, new BlockOptionalMetaLookup(
+                Stream.of(blocks)
+                        .map(BlockOptionalMeta::new)
+                        .toArray(BlockOptionalMeta[]::new)
+        ));
+    }
+
     /**
      * Begin to search for and mine the specified blocks.
      *
@@ -105,6 +134,10 @@ public interface IMineProcess extends IBaritoneProcess {
      */
     default void mine(Block... blocks) {
         mine(0, blocks);
+    }
+
+    default void mineAndCollect(Block... blocks) {
+        mineAndCollect(0, blocks);
     }
 
     /**

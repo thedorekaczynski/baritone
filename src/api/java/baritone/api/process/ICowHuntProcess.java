@@ -15,19 +15,17 @@
  * along with Baritone.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-pluginManagement {
-    repositories {
-        maven {
-            name = 'FabricMaven'
-            url = 'https://maven.fabricmc.net/'
-        }
-        mavenCentral()
-        gradlePluginPortal() {
-            content {
-                excludeGroup "org.apache.logging.log4j"
-            }
-        }
-    }
-}
+package baritone.api.process;
 
-rootProject.name = 'baritone'
+import baritone.api.selection.ISelection;
+
+public interface ICowHuntProcess extends IBaritoneProcess {
+
+    void hunt();
+
+    String status();
+
+    int protect(String name, ISelection[] selections);
+
+    int clearProtected(String name);
+}

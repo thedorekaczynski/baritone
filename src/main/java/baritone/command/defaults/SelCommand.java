@@ -107,6 +107,23 @@ public class SelCommand extends Command {
             args.requireMax(0);
             pos1 = null;
             logDirect(String.format("Removed %d selections", manager.removeAllSelections().length));
+        } else if (action == Action.FARM || action == Action.RANCH) {
+            args.requireMax(0);
+            ISelection[] selections = manager.getSelections();
+            if (selections.length == 0) {
+                throw new CommandInvalidStateException("No selections to save");
+            }
+            String name = action == Action.FARM ? "farm" : "ranch";
+            int count = baritone.getCowHuntProcess().protect(name, selections);
+            logDirect(String.format("Saved %d protected cowhunt zone(s) as '%s'", count, name));
+        } else if (action == Action.UNFARM || action == Action.UNRANCH) {
+            args.requireMax(0);
+            String name = action == Action.UNFARM ? "farm" : "ranch";
+            int count = baritone.getCowHuntProcess().clearProtected(name);
+            if (count == 0) {
+                throw new CommandInvalidStateException("No protected cowhunt zones saved as '" + name + "'");
+            }
+            logDirect(String.format("Cleared %d protected cowhunt zone(s) from '%s'", count, name));
         } else if (action == Action.UNDO) {
             args.requireMax(0);
             if (pos1 != null) {
@@ -333,6 +350,10 @@ public class SelCommand extends Command {
                 "> sel pos2/p2/2 <x> <y> <z> - Set position 2 to a relative position.",
                 "",
                 "> sel clear/c - Clear the selection.",
+                "> sel farm - Save the current selections as a protected cowhunt farm zone.",
+                "> sel ranch - Save the current selections as a protected cowhunt ranch zone.",
+                "> sel unfarm - Remove the saved protected cowhunt farm zone.",
+                "> sel unranch - Remove the saved protected cowhunt ranch zone.",
                 "> sel undo/u - Undo the last action (setting positions, creating selections, etc.)",
                 "> sel set/fill/s/f [block] - Completely fill all selections with a block.",
                 "> sel walls/w [block] - Fill in the walls of the selection with a specified block.",
@@ -356,6 +377,10 @@ public class SelCommand extends Command {
         POS1("pos1", "p1", "1"),
         POS2("pos2", "p2", "2"),
         CLEAR("clear", "c"),
+        FARM("farm"),
+        RANCH("ranch"),
+        UNFARM("unfarm"),
+        UNRANCH("unranch"),
         UNDO("undo", "u"),
         SET("set", "fill", "s", "f"),
         WALLS("walls", "w"),

@@ -15,148 +15,163 @@
  * along with Baritone.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-allprojects {
-    apply plugin: 'java'
-    apply plugin: "xyz.wagyourtail.unimined"
-    apply plugin: "maven-publish"
+plugins {
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+    id 'maven-publish'
+}
 
-    archivesBaseName = rootProject.archives_base_name
+base {
+    archivesName = rootProject.archives_base_name
+}
 
-    def vers = ""
-    try {
-        vers = 'git describe --always --tags --first-parent --dirty'.execute().text.trim()
-    } catch (Exception e) {
-        println "Version detection failed: " + e
+def vers = ""
+try {
+    vers = 'git describe --always --tags --first-parent --dirty'.execute().text.trim()
+} catch (Exception e) {
+    println "Version detection failed: " + e
+}
+if (!vers.startsWith("v")) {
+    println "using version number: " + rootProject.mod_version
+    version = rootProject.mod_version
+} else {
+    version = vers.substring(1)
+    println "Detected version " + version
+}
+group = rootProject.maven_group
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+repositories {
+    maven {
+        name = 'spongepowered-repo'
+        url = 'https://repo.spongepowered.org/repository/maven-public/'
     }
-    if (!vers.startsWith("v")) {
-        println "using version number: " + rootProject.mod_version
-        version = rootProject.mod_version
-    } else {
-        version = vers.substring(1)
-        println "Detected version " + version
-    }
-    group = rootProject.maven_group
-
-    sourceCompatibility = targetCompatibility = JavaVersion.toVersion(project.java_version)
-
-    java {
-        toolchain {
-            languageVersion.set(JavaLanguageVersion.of(sourceCompatibility.majorVersion.toInteger()))
-        }
-    }
-
-    repositories {
-        maven {
-            url = "https://files.minecraftforge.net/maven/"
-        }
-        maven {
-            name = 'spongepowered-repo'
-            url = 'https://repo.spongepowered.org/repository/maven-public/'
-        }
-        maven {
-            name = 'fabric-maven'
-            url = 'https://maven.fabricmc.net/'
-        }
-        maven {
-            name = 'impactdevelopment-repo'
-            url = 'https://impactdevelopment.github.io/maven/'
-        }
-        maven {
-            name = "ldtteam"
-            url = "https://maven.parchmentmc.net/"
-        }
-        // for the newer version of launchwrapper
-        maven {
-            name = "multimc-maven"
-            url = "https://files.multimc.org/maven/"
-            metadataSources {
-                artifact()
-            }
-        }
-        mavenCentral()
-        maven {
-            name = 'babbaj-repo'
-            url = 'https://babbaj.github.io/maven/'
-        }
-    }
-
-    dependencies {
-        compileOnly "org.spongepowered:mixin:${project.mixin_version}"
-        compileOnly "org.ow2.asm:asm:${project.asm_version}"
-
-        implementation "dev.babbaj:nether-pathfinder:${project.nether_pathfinder_version}"
-
-        implementation 'com.google.code.findbugs:jsr305:3.0.2'
-    }
-
-    unimined.minecraft(sourceSets.main, true) {
-        version rootProject.minecraft_version
-
-        mappings {
-            intermediary()
-            mojmap()
-            parchment("1.21.4", "2025.03.23")
-
-            devFallbackNamespace "official"
-        }
-    }
-
-    tasks.withType(JavaCompile).configureEach {
-        it.options.encoding = "UTF-8"
-
-        def targetVersion = project.java_version.toInteger()
-        if (JavaVersion.current().isJava9Compatible()) {
-            it.options.release = targetVersion
-        }
+    mavenCentral()
+    maven {
+        name = 'babbaj-repo'
+        url = 'https://babbaj.github.io/maven/'
     }
 }
 
-unimined.minecraft {
-    runs.off = true
-    defaultRemapJar = false
-}
-
-archivesBaseName = archivesBaseName + "-common"
-
-sourceSets {
-    api {
-        compileClasspath += main.compileClasspath
-        runtimeClasspath += main.runtimeClasspath
-    }
-    main {
-        compileClasspath += api.output
-        runtimeClasspath += api.output
-    }
-    test {
-        compileClasspath += main.compileClasspath + main.runtimeClasspath + main.output
-        runtimeClasspath += main.compileClasspath + main.runtimeClasspath + main.output
-    }
-    launch {
-        compileClasspath += main.compileClasspath + main.runtimeClasspath + main.output
-        runtimeClasspath += main.compileClasspath + main.runtimeClasspath + main.output
-    }
-    schematica_api {
-        compileClasspath += main.compileClasspath
-        runtimeClasspath += main.runtimeClasspath
-    }
-    main {
-        compileClasspath += schematica_api.output
-        runtimeClasspath += schematica_api.output
-    }
-}
+def loomCacheDir = new File(gradle.gradleUserHomeDir, "caches/fabric-loom/${project.minecraft_version}")
+def minecraftCompileJars = files(
+        new File(loomCacheDir, "minecraft-client.jar"),
+        new File(loomCacheDir, "minecraft-extracted_server.jar")
+)
 
 dependencies {
+    // Minecraft - no mappings needed for 26.1 (unobfuscated)
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+
+    // Fabric Loader
+    implementation "net.fabricmc:fabric-loader:${project.fabric_version}"
+    compileOnly minecraftCompileJars
+
+    // Mixin
+    compileOnly "org.spongepowered:mixin:${project.mixin_version}"
+    compileOnly "org.ow2.asm:asm:${project.asm_version}"
+
+    // Nether pathfinder
+    implementation "dev.babbaj:nether-pathfinder:${project.nether_pathfinder_version}"
+    include "dev.babbaj:nether-pathfinder:${project.nether_pathfinder_version}"
+
+    implementation 'com.google.code.findbugs:jsr305:3.0.2'
+
     testImplementation 'junit:junit:4.13.2'
 }
 
+sourceSets {
+    api
+    schematica_api
+    launch
+}
+
+// All custom source sets share the same MC + library dependencies
+dependencies {
+    // MC + libs for api source set
+    apiCompileOnly minecraftCompileJars
+    apiCompileOnly "net.fabricmc:fabric-loader:${project.fabric_version}"
+    apiCompileOnly "org.spongepowered:mixin:${project.mixin_version}"
+    apiCompileOnly "org.ow2.asm:asm:${project.asm_version}"
+    apiCompileOnly 'com.google.code.findbugs:jsr305:3.0.2'
+
+    // MC + libs for schematica_api source set
+    schematica_apiCompileOnly minecraftCompileJars
+    schematica_apiCompileOnly "net.fabricmc:fabric-loader:${project.fabric_version}"
+
+    // MC + libs for launch source set
+    launchCompileOnly minecraftCompileJars
+    launchCompileOnly "net.fabricmc:fabric-loader:${project.fabric_version}"
+    launchCompileOnly "org.spongepowered:mixin:${project.mixin_version}"
+    launchCompileOnly "org.ow2.asm:asm:${project.asm_version}"
+    launchCompileOnly 'com.google.code.findbugs:jsr305:3.0.2'
+}
+
+configurations {
+    apiCompileClasspath.extendsFrom compileClasspath
+    schematica_apiCompileClasspath.extendsFrom compileClasspath
+    launchCompileClasspath.extendsFrom compileClasspath
+    testCompileClasspath.extendsFrom compileClasspath
+}
+
+sourceSets {
+    main {
+        compileClasspath += sourceSets.api.output + sourceSets.schematica_api.output
+    }
+    test {
+        compileClasspath += sourceSets.api.output + sourceSets.main.output + sourceSets.schematica_api.output + sourceSets.launch.output
+        runtimeClasspath += sourceSets.api.output + sourceSets.main.output + sourceSets.schematica_api.output + sourceSets.launch.output
+    }
+    launch {
+        compileClasspath += sourceSets.main.output + sourceSets.api.output + sourceSets.schematica_api.output
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.encoding = "UTF-8"
+    it.options.release = 25
+}
+
+tasks.named('test', Test).configure {
+    classpath = sourceSets.test.runtimeClasspath +
+            sourceSets.api.output +
+            sourceSets.main.output +
+            sourceSets.schematica_api.output +
+            sourceSets.launch.output +
+            minecraftCompileJars
+}
+
+processResources {
+    inputs.property "version", project.version
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
 jar {
-    from sourceSets.main.output, sourceSets.launch.output, sourceSets.api.output
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from sourceSets.main.output, sourceSets.launch.output, sourceSets.api.output, sourceSets.schematica_api.output
 }
 
 javadoc {
-    options.addStringOption('Xwerror', '-quiet') // makes the build fail on travis when there is a javadoc error
+    options.addStringOption('Xwerror', '-quiet')
     options.linkSource true
-    options.encoding "UTF-8" // allow emoji in comments :^)
+    options.encoding "UTF-8"
     source = sourceSets.api.allJava
     classpath += sourceSets.api.compileClasspath
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            artifactId = rootProject.archives_base_name
+            from components.java
+        }
+    }
+    repositories {
+    }
 }
