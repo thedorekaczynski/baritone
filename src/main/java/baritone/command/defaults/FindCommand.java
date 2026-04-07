@@ -18,12 +18,14 @@
 package baritone.command.defaults;
 
 import baritone.api.IBaritone;
+import baritone.api.BaritoneAPI;
 import baritone.api.command.Command;
 import baritone.api.command.argument.IArgConsumer;
 import baritone.api.command.datatypes.BlockById;
 import baritone.api.command.exception.CommandException;
 import baritone.api.command.helpers.TabCompleteHelper;
 import baritone.api.utils.BetterBlockPos;
+import baritone.api.utils.BlockOptionalMetaLookup;
 import baritone.cache.CachedChunk;
 import net.minecraft.ChatFormatting;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -35,12 +37,18 @@ import net.minecraft.world.level.block.Block;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.stream.Stream;
 
 import static baritone.api.command.IBaritoneChatControl.FORCE_COMMAND_PREFIX;
 
 public class FindCommand extends Command {
+
+    private static final int MAX_LOADED_SEARCH_RESULTS = 128;
+    private static final int MAX_CACHED_SEARCH_RESULTS = 128;
+    private static final int LOADED_SEARCH_RADIUS_CHUNKS = 32;
 
     public FindCommand(IBaritone baritone) {
         super(baritone, "find");
@@ -54,23 +62,34 @@ public class FindCommand extends Command {
             toFind.add(args.getDatatypeFor(BlockById.INSTANCE));
         }
         BetterBlockPos origin = ctx.playerFeet();
-        Component[] components = toFind.stream()
-                .flatMap(block ->
-                        ctx.worldData().getCachedWorld().getLocationsOf(
-                                BuiltInRegistries.BLOCK.getKey(block).getPath(),
-                                Integer.MAX_VALUE,
-                                origin.x,
-                                origin.y,
-                                4
-                        ).stream()
-                )
+        LinkedHashSet<BetterBlockPos> results = new LinkedHashSet<>();
+        for (Block block : toFind) {
+            BaritoneAPI.getProvider().getWorldScanner().scanChunkRadius(
+                    ctx,
+                    new BlockOptionalMetaLookup(block),
+                    MAX_LOADED_SEARCH_RESULTS,
+                    10,
+                    LOADED_SEARCH_RADIUS_CHUNKS
+            ).stream().map(BetterBlockPos::new).forEach(results::add);
+            if (CachedChunk.BLOCKS_TO_KEEP_TRACK_OF.contains(block)) {
+                ctx.worldData().getCachedWorld().getLocationsOf(
+                        BuiltInRegistries.BLOCK.getKey(block).getPath(),
+                        MAX_CACHED_SEARCH_RESULTS,
+                        origin.x,
+                        origin.z,
+                        4
+                ).stream().map(BetterBlockPos::new).forEach(results::add);
+            }
+        }
+        Component[] components = results.stream()
+                .sorted(Comparator.comparingDouble(origin::distanceSq))
                 .map(BetterBlockPos::new)
                 .map(this::positionToComponent)
                 .toArray(Component[]::new);
         if (components.length > 0) {
             Arrays.asList(components).forEach(this::logDirect);
         } else {
-            logDirect("No positions known, are you sure the blocks are cached?");
+            logDirect("No positions found in loaded chunks or tracked cache.");
         }
     }
 
@@ -91,8 +110,7 @@ public class FindCommand extends Command {
     public Stream<String> tabComplete(String label, IArgConsumer args) throws CommandException {
         return new TabCompleteHelper()
                 .append(
-                        CachedChunk.BLOCKS_TO_KEEP_TRACK_OF.stream()
-                                .map(BuiltInRegistries.BLOCK::getKey)
+                        BuiltInRegistries.BLOCK.keySet().stream()
                                 .map(Object::toString)
                 )
                 .filterPrefixNamespaced(args.getString())
@@ -108,8 +126,8 @@ public class FindCommand extends Command {
     @Override
     public List<String> getLongDesc() {
         return Arrays.asList(
-                "The find command searches through Baritone's cache and attempts to find the location of the block.",
-                "Tab completion will suggest only cached blocks and uncached blocks can not be found.",
+                "The find command searches loaded chunks first and also checks Baritone's tracked block cache when available.",
+                "Tracked cache results are only available for blocks Baritone explicitly keeps indexed.",
                 "",
                 "Usage:",
                 "> find <block> [...] - Try finding the listed blocks"

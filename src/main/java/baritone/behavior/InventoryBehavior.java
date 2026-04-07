@@ -46,6 +46,13 @@ import java.util.function.Predicate;
 
 public final class InventoryBehavior extends Behavior implements Helper {
 
+    public enum ItemSelectionResult {
+        READY,
+        CHANGED,
+        PENDING,
+        NOT_FOUND
+    }
+
     int ticksSinceLastInventoryMove;
     int[] lastTickRequestedMove; // not everything asks every tick, so remember the request while coming to a halt
 
@@ -182,6 +189,60 @@ public final class InventoryBehavior extends Behavior implements Helper {
             }
         }
         return false;
+    }
+
+    public ItemSelectionResult selectItem(Predicate<? super ItemStack> desired) {
+        return selectItem(desired, Baritone.settings().allowInventory.value, 7);
+    }
+
+    public boolean hasItem(Predicate<? super ItemStack> desired) {
+        return hasItem(desired, Baritone.settings().allowInventory.value);
+    }
+
+    public boolean hasItem(Predicate<? super ItemStack> desired, boolean allowInventory) {
+        NonNullList<ItemStack> inv = ctx.player().getInventory().getNonEquipmentItems();
+        for (int i = 0; i < 9; i++) {
+            if (desired.test(inv.get(i))) {
+                return true;
+            }
+        }
+        if (!allowInventory) {
+            return false;
+        }
+        for (int i = 9; i < 36; i++) {
+            if (desired.test(inv.get(i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public ItemSelectionResult selectItem(Predicate<? super ItemStack> desired, boolean allowInventory, int inventoryHotbarSlot) {
+        LocalPlayer p = ctx.player();
+        NonNullList<ItemStack> inv = p.getInventory().getNonEquipmentItems();
+        int selectedSlot = p.getInventory().getSelectedSlot();
+        if (selectedSlot >= 0 && selectedSlot < 9 && desired.test(inv.get(selectedSlot))) {
+            return ItemSelectionResult.READY;
+        }
+        for (int i = 0; i < 9; i++) {
+            if (desired.test(inv.get(i))) {
+                p.getInventory().setSelectedSlot(i);
+                return ItemSelectionResult.CHANGED;
+            }
+        }
+        if (!allowInventory || inventoryHotbarSlot < 0 || inventoryHotbarSlot > 8) {
+            return ItemSelectionResult.NOT_FOUND;
+        }
+        for (int i = 9; i < 36; i++) {
+            if (desired.test(inv.get(i))) {
+                if (!requestSwapWithHotBar(i, inventoryHotbarSlot)) {
+                    return ItemSelectionResult.PENDING;
+                }
+                p.getInventory().setSelectedSlot(inventoryHotbarSlot);
+                return ItemSelectionResult.CHANGED;
+            }
+        }
+        return ItemSelectionResult.NOT_FOUND;
     }
 
     public boolean throwaway(boolean select, Predicate<? super ItemStack> desired) {

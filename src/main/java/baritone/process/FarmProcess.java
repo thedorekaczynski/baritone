@@ -347,6 +347,23 @@ public final class FarmProcess extends BaritoneProcessHelper implements IFarmPro
             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
         }
 
+        // Prioritize picking up dropped farm items before moving on to the next crop
+        List<Goal> itemGoals = new ArrayList<>();
+        for (Entity entity : ctx.entities()) {
+            if (entity instanceof ItemEntity && entity.onGround()) {
+                ItemEntity ei = (ItemEntity) entity;
+                if (PICKUP_DROPPED.contains(ei.getItem().getItem())) {
+                    if (range == 0 || entity.position().distanceTo(Vec3.atCenterOf(center)) <= range) {
+                        // +0.1 because of farmland's 0.9375 dummy height lol
+                        itemGoals.add(new GoalBlock(new BetterBlockPos(entity.position().x, entity.position().y + 0.1, entity.position().z)));
+                    }
+                }
+            }
+        }
+        if (!itemGoals.isEmpty()) {
+            return new PathingCommand(new GoalComposite(itemGoals.toArray(new Goal[0])), PathingCommandType.SET_GOAL_AND_PATH);
+        }
+
         List<Goal> goalz = new ArrayList<>();
         for (BlockPos pos : toBreak) {
             goalz.add(new BuilderProcess.GoalBreak(pos));
@@ -373,15 +390,6 @@ public final class FarmProcess extends BaritoneProcessHelper implements IFarmPro
         if (baritone.getInventoryBehavior().throwaway(false, this::isBoneMeal)) {
             for (BlockPos pos : bonemealable) {
                 goalz.add(new GoalBlock(pos));
-            }
-        }
-        for (Entity entity : ctx.entities()) {
-            if (entity instanceof ItemEntity && entity.onGround()) {
-                ItemEntity ei = (ItemEntity) entity;
-                if (PICKUP_DROPPED.contains(ei.getItem().getItem())) {
-                    // +0.1 because of farmland's 0.9375 dummy height lol
-                    goalz.add(new GoalBlock(new BetterBlockPos(entity.position().x, entity.position().y + 0.1, entity.position().z)));
-                }
             }
         }
         if (goalz.isEmpty()) {

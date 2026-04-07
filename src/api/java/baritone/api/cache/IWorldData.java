@@ -17,6 +17,10 @@
 
 package baritone.api.cache;
 
+import baritone.api.selection.ISelection;
+
+import java.util.Set;
+
 /**
  * @author Brady
  * @since 9/24/2018
@@ -36,5 +40,32 @@ public interface IWorldData {
      * @return The waypoint collection for this world
      */
     IWaypointCollection getWaypoints();
+
+    /**
+     * @return The names of all saved selections for this world
+     */
+    Set<String> getSavedSelectionNames();
+
+    /**
+     * @param name The saved selection name
+     * @return A copy of the saved selections for that name, or {@code null} if none exist
+     */
+    ISelection[] getSavedSelection(String name);
+
+    /**
+     * Saves the given selections under the specified name, replacing any existing saved selection of that name.
+     *
+     * @param name       The saved selection name
+     * @param selections The selections to save
+     */
+    void saveSelection(String name, ISelection[] selections);
+
+    /**
+     * Removes a saved selection by name.
+     *
+     * @param name The saved selection name
+     * @return {@code true} if a saved selection was removed
+     */
+    boolean removeSavedSelection(String name);
 
 }

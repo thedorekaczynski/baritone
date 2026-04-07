@@ -17,6 +17,7 @@
 
 package baritone.command.defaults;
 
+import baritone.Baritone;
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 import baritone.api.command.Command;
@@ -33,7 +34,7 @@ import java.util.stream.Stream;
 public class HarvestCommand extends Command {
 
     public HarvestCommand(IBaritone baritone) {
-        super(baritone, "harvest", "minecollect");
+        super(baritone, "harvest");
     }
 
     @Override
@@ -46,7 +47,7 @@ public class HarvestCommand extends Command {
         }
         BaritoneAPI.getProvider().getWorldScanner().repack(ctx);
         logDirect(String.format("Harvesting %s", boms));
-        baritone.getMineProcess().mineAndCollect(quantity, boms.toArray(new BlockOptionalMeta[0]));
+        ((Baritone) baritone).getHarvestProcess().harvest(quantity, boms.toArray(new BlockOptionalMeta[0]));
     }
 
     @Override

@@ -646,6 +646,18 @@ public final class Settings {
     public final Setting<Boolean> chunkCaching = new Setting<>(true);
 
     /**
+     * Wait this many seconds after a world loads before background cache region reads begin.
+     * This keeps Baritone from hammering disk immediately on join.
+     */
+    public final Setting<Long> chunkCacheLoadDelaySeconds = new Setting<>(5L);
+
+    /**
+     * Minimum delay between background cache region reads from disk.
+     * Higher values reduce startup hitches at the cost of slower cache warmup.
+     */
+    public final Setting<Long> chunkCacheLoadIntervalMS = new Setting<>(250L);
+
+    /**
      * On save, delete from RAM any cached regions that are more than 1024 blocks away from the player
      * <p>
      * Temporarily disabled
@@ -1241,6 +1253,76 @@ public final class Settings {
     public final Setting<Integer> followTargetMaxDistance = new Setting<>(0);
 
     /**
+     * Pause pathing and attack nearby hostile mobs using vanilla combat timing.
+     */
+    public final Setting<Boolean> killAuraHostiles = new Setting<>(false);
+
+    /**
+     * Maximum squared-distance combat radius for {@link #killAuraHostiles}.
+     */
+    public final Setting<Double> killAuraHostileRange = new Setting<>(4.5D);
+
+    /**
+     * Attack strength scale required before swinging in {@link #killAuraHostiles}.
+     */
+    public final Setting<Double> killAuraAttackCooldown = new Setting<>(0.92D);
+
+    /**
+     * Prefer swords over axes when choosing a kill aura melee weapon.
+     */
+    public final Setting<Boolean> killAuraPreferSword = new Setting<>(true);
+
+    /**
+     * Where sentry contact reports should be emitted.
+     */
+    public final Setting<SentryReportMode> sentryReportMode = new Setting<>(SentryReportMode.LOG);
+
+    /**
+     * How many ticks sentry should hold each patrol endpoint while scanning.
+     */
+    public final Setting<Integer> sentryHoldTicks = new Setting<>(40);
+
+    /**
+     * How far sentry can be from an endpoint before it counts as arrived.
+     */
+    public final Setting<Integer> sentryArrivalRadius = new Setting<>(2);
+
+    /**
+     * Default patrol radius used by sentry auto mode.
+     */
+    public final Setting<Integer> sentryAutoRadius = new Setting<>(24);
+
+    /**
+     * The yaw span, in degrees, for sentry's left-to-right scan.
+     */
+    public final Setting<Float> sentryScanAngle = new Setting<>(55F);
+
+    /**
+     * The number of discrete aim points used during sentry's hold scan.
+     */
+    public final Setting<Integer> sentryScanSteps = new Setting<>(3);
+
+    /**
+     * Whether sentry should auto-attack nearby hostile mobs while guarding.
+     */
+    public final Setting<Boolean> sentryAutoAttackHostiles = new Setting<>(true);
+
+    /**
+     * Prefer swords over axes while sentry is selecting a weapon.
+     */
+    public final Setting<Boolean> sentryPreferSword = new Setting<>(true);
+
+    /**
+     * Pause pathing to eat food from the hotbar when hunger is low.
+     */
+    public final Setting<Boolean> autoEat = new Setting<>(false);
+
+    /**
+     * Start auto eating when hunger is at or below this level.
+     */
+    public final Setting<Integer> autoEatHungerThreshold = new Setting<>(5);
+
+    /**
      * Turn this on if your exploration filter is enormous, you don't want it to check if it's done,
      * and you are just fine with it just hanging on completion
      */
@@ -1486,6 +1568,34 @@ public final class Settings {
     public final Setting<Boolean> elytraAutoJump = new Setting<>(false);
 
     /**
+     * The preferred cruising altitude for overworld elytra travel. The planner will increase this if needed to stay
+     * above the start or destination, and may climb higher if loaded terrain blocks the route.
+     */
+    public final Setting<Integer> elytraOverworldCruiseY = new Setting<>(224);
+
+    /**
+     * Horizontal spacing, in blocks, between overworld elytra waypoint samples. Lower values track terrain changes
+     * more closely, while higher values reduce path churn.
+     */
+    public final Setting<Integer> elytraOverworldWaypointDistance = new Setting<>(96);
+
+    /**
+     * Minimum desired clearance, in blocks, above sampled overworld terrain while cruising with an elytra.
+     */
+    public final Setting<Integer> elytraOverworldTerrainClearance = new Setting<>(24);
+
+    /**
+     * Horizontal lookahead distance, in blocks, used by the overworld elytra solver when sampling upcoming terrain.
+     */
+    public final Setting<Integer> elytraOverworldTerrainLookahead = new Setting<>(96);
+
+    /**
+     * If enabled, overworld elytra landings may prefer nearby water around the goal and use a steep splashdown
+     * approach instead of a dry touchdown.
+     */
+    public final Setting<Boolean> elytraOverworldWaterDive = new Setting<>(false);
+
+    /**
      * The seed used to generate chunks for long distance elytra path-finding in the nether.
      * Defaults to 2b2t's nether seed.
      */
@@ -1558,6 +1668,12 @@ public final class Settings {
     public final List<Setting<?>> allSettings;
 
     public final Map<Setting<?>, Type> settingTypes;
+
+    public enum SentryReportMode {
+        OFF,
+        LOG,
+        CHAT
+    }
 
     public final class Setting<T> {
 

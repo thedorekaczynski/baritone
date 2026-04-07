@@ -21,11 +21,13 @@ import baritone.Baritone;
 import baritone.api.cache.ICachedWorld;
 import baritone.api.cache.IWaypointCollection;
 import baritone.api.cache.IWorldData;
+import baritone.api.selection.ISelection;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.dimension.DimensionType;
 
 import java.nio.file.Path;
+import java.util.Set;
 
 /**
  * Data about a world, from baritone's point of view. Includes cached chunks, waypoints, and map data.
@@ -36,6 +38,7 @@ public class WorldData implements IWorldData {
 
     public final CachedWorld cache;
     private final WaypointCollection waypoints;
+    private final SelectionCollection selections;
     //public final MapData map;
     public final Path directory;
     public final DimensionType dimension;
@@ -44,6 +47,7 @@ public class WorldData implements IWorldData {
         this.directory = directory;
         this.cache = new CachedWorld(directory.resolve("cache"), dimension, dimensionId);
         this.waypoints = new WaypointCollection(directory.resolve("waypoints"));
+        this.selections = new SelectionCollection(directory.resolve("selections.mp4"));
         this.dimension = dimension;
     }
 
@@ -62,5 +66,25 @@ public class WorldData implements IWorldData {
     @Override
     public IWaypointCollection getWaypoints() {
         return this.waypoints;
+    }
+
+    @Override
+    public Set<String> getSavedSelectionNames() {
+        return this.selections.getNames();
+    }
+
+    @Override
+    public ISelection[] getSavedSelection(String name) {
+        return this.selections.getSelection(name);
+    }
+
+    @Override
+    public void saveSelection(String name, ISelection[] selections) {
+        this.selections.putSelection(name, selections);
+    }
+
+    @Override
+    public boolean removeSavedSelection(String name) {
+        return this.selections.remove(name);
     }
 }

@@ -269,8 +269,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     private Optional<Tuple<BetterBlockPos, Rotation>> toBreakNearPlayer(BuilderCalculationContext bcc) {
         BetterBlockPos center = ctx.playerFeet();
         BetterBlockPos pathStart = baritone.getPathingBehavior().pathStart();
+        int minDy = ctx.world().getFluidState(center).isEmpty()
+                ? (Baritone.settings().breakFromAbove.value ? -1 : 0)
+                : -5;
         for (int dx = -5; dx <= 5; dx++) {
-            for (int dy = Baritone.settings().breakFromAbove.value ? -1 : 0; dy <= 5; dy++) {
+            for (int dy = minDy; dy <= 5; dy++) {
                 for (int dz = -5; dz <= 5; dz++) {
                     int x = center.x + dx;
                     int y = center.y + dy;
@@ -531,8 +534,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             trim();
         }
 
+        boolean canInteractNow = canInteractWhileInFluidOrOnGround();
         Optional<Tuple<BetterBlockPos, Rotation>> toBreak = toBreakNearPlayer(bcc);
-        if (toBreak.isPresent() && isSafeToCancel && ctx.player().onGround()) {
+        if (toBreak.isPresent() && isSafeToCancel && canInteractNow) {
             // we'd like to pause to break this block
             // only change look direction if it's safe (don't want to fuck up an in progress parkour for example
             Rotation rot = toBreak.get().getB();
@@ -552,7 +556,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
         List<BlockState> desirableOnHotbar = new ArrayList<>();
         Optional<Placement> toPlace = searchForPlacables(bcc, desirableOnHotbar);
-        if (toPlace.isPresent() && isSafeToCancel && ctx.player().onGround() && ticks <= 0) {
+        if (toPlace.isPresent() && isSafeToCancel && canInteractNow && ticks <= 0) {
             Rotation rot = toPlace.get().rot;
             baritone.getLookBehavior().updateTarget(rot, true);
             ctx.player().getInventory().setSelectedSlot(toPlace.get().hotbarSelection);
@@ -606,6 +610,16 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             }
         }
         return new PathingCommandContext(goal, PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH, bcc);
+    }
+
+    private boolean canInteractWhileInFluidOrOnGround() {
+        if (ctx.player().onGround()) {
+            return true;
+        }
+        if (ctx.world().getFluidState(ctx.playerFeet()).isEmpty()) {
+            return false;
+        }
+        return ctx.player().getDeltaMovement().y >= -0.1;
     }
 
     private boolean recalc(BuilderCalculationContext bcc) {
@@ -705,28 +719,36 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         List<BetterBlockPos> breakable = new ArrayList<>();
         List<BetterBlockPos> sourceLiquids = new ArrayList<>();
         List<BetterBlockPos> flowingLiquids = new ArrayList<>();
-        Map<BlockState, Integer> missing = new HashMap<>();
+        Set<Block> missingBlocks = new HashSet<>();
         List<BetterBlockPos> outOfBounds = new ArrayList<>();
         incorrectPositions.forEach(pos -> {
             BlockState state = bcc.bsi.get0(pos);
-            if (state.getBlock() instanceof AirBlock) {
-                BlockState desired = bcc.getSchematic(pos.x, pos.y, pos.z, state);
-                if (desired == null) {
-                    outOfBounds.add(pos);
-                } else if (containsBlockState(approxPlaceable, desired)) {
+            BlockState desired = bcc.getSchematic(pos.x, pos.y, pos.z, state);
+            if (desired == null) {
+                outOfBounds.add(pos);
+            } else if (state.getBlock() instanceof AirBlock) {
+                if (containsBlockState(approxPlaceable, desired)) {
                     placeable.add(pos);
                 } else {
-                    missing.put(desired, 1 + missing.getOrDefault(desired, 0));
+                    missingBlocks.add(desired.getBlock());
                 }
             } else {
                 if (state.getBlock() instanceof LiquidBlock) {
-                    // if the block itself is JUST a liquid (i.e. not just a waterlogged block), we CANNOT break it
-                    // TODO for 1.13 make sure that this only matches pure water, not waterlogged blocks
-                    if (!MovementHelper.possiblyFlowing(state)) {
-                        // if it's a source block then we want to replace it with a throwaway
-                        sourceLiquids.add(pos);
+                    if (!(desired.getBlock() instanceof AirBlock)) {
+                        if (containsBlockState(approxPlaceable, desired)) {
+                            placeable.add(pos);
+                        } else {
+                            missingBlocks.add(desired.getBlock());
+                        }
                     } else {
-                        flowingLiquids.add(pos);
+                        // if the block itself is JUST a liquid (i.e. not just a waterlogged block), we CANNOT break it
+                        // TODO for 1.13 make sure that this only matches pure water, not waterlogged blocks
+                        if (!MovementHelper.possiblyFlowing(state)) {
+                            // if it's a source block then we want to replace it with a throwaway
+                            sourceLiquids.add(pos);
+                        } else {
+                            flowingLiquids.add(pos);
+                        }
                     }
                 } else {
                     breakable.add(pos);
@@ -748,10 +770,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             return new JankyGoalComposite(new GoalComposite(toPlace.toArray(new Goal[0])), new GoalComposite(toBreak.toArray(new Goal[0])));
         }
         if (toBreak.isEmpty()) {
-            if (logMissing && !missing.isEmpty()) {
-                logDirect("Missing materials for at least:");
-                logDirect(missing.entrySet().stream()
-                        .map(e -> String.format("%sx %s", e.getValue(), e.getKey()))
+            if (logMissing && !missingBlocks.isEmpty()) {
+                logDirect("Missing required materials. Counts omitted because selection estimates are unreliable.");
+                logDirect(missingBlocks.stream()
+                        .map(BlockUtils::blockToString)
+                        .sorted(String.CASE_INSENSITIVE_ORDER)
                         .collect(Collectors.joining("\n")));
             }
             if (logMissing && !flowingLiquids.isEmpty()) {

@@ -39,7 +39,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
  * @author Brady
@@ -69,6 +72,16 @@ public final class CachedWorld implements ICachedWorld, Helper {
     private final LinkedBlockingQueue<ChunkPos> toPackQueue = new LinkedBlockingQueue<>();
 
     /**
+     * Queue of region coordinates that should be loaded from disk in the background.
+     */
+    private final LinkedBlockingQueue<RegionLoadRequest> regionLoadQueue = new LinkedBlockingQueue<>();
+
+    /**
+     * Region ids currently queued or being loaded from disk.
+     */
+    private final Set<Long> queuedRegionLoads = ConcurrentHashMap.newKeySet();
+
+    /**
      * All chunk positions pending packing. This map will be updated in-place if a new update to the chunk occurs
      * while waiting in the queue for the packer thread to get to it.
      */
@@ -77,6 +90,10 @@ public final class CachedWorld implements ICachedWorld, Helper {
     private final DimensionType dimension;
 
     private final ResourceKey<Level> dimensionId;
+
+    private final long createdAt;
+
+    private long nextRegionLoadAt;
 
     CachedWorld(Path directory, DimensionType dimension, ResourceKey<Level> dimensionId) {
         if (!Files.exists(directory)) {
@@ -88,8 +105,10 @@ public final class CachedWorld implements ICachedWorld, Helper {
         this.directory = directory.toString();
         this.dimension = dimension;
         this.dimensionId = dimensionId;
+        this.createdAt = System.currentTimeMillis();
         System.out.println("Cached world directory: " + directory);
         Baritone.getExecutor().execute(new PackerThread());
+        Baritone.getExecutor().execute(new RegionLoaderThread());
         Baritone.getExecutor().execute(() -> {
             try {
                 Thread.sleep(30000);
@@ -142,10 +161,12 @@ public final class CachedWorld implements ICachedWorld, Helper {
                     }
                     int regionX = xoff + centerRegionX;
                     int regionZ = zoff + centerRegionZ;
-                    CachedRegion region = getOrCreateRegion(regionX, regionZ);
+                    CachedRegion region = getRegion(regionX, regionZ);
                     if (region != null) {
                         // TODO: 100% verify if this or addAll is faster.
                         res.addAll(region.getLocationsOf(block));
+                    } else {
+                        queueRegionLoad(regionX, regionZ);
                     }
                 }
             }
@@ -266,15 +287,53 @@ public final class CachedWorld implements ICachedWorld, Helper {
      * @return The region located at the specified coordinates
      */
     private synchronized CachedRegion getOrCreateRegion(int regionX, int regionZ) {
-        return cachedRegions.computeIfAbsent(getRegionID(regionX, regionZ), id -> {
-            CachedRegion newRegion = new CachedRegion(regionX, regionZ, dimension, dimensionId);
-            newRegion.load(this.directory);
-            return newRegion;
-        });
+        long regionId = getRegionID(regionX, regionZ);
+        CachedRegion existing = cachedRegions.get(regionId);
+        if (existing != null) {
+            return existing;
+        }
+        CachedRegion newRegion = new CachedRegion(regionX, regionZ, dimension, dimensionId);
+        newRegion.load(this.directory);
+        CachedRegion raced = cachedRegions.get(regionId);
+        if (raced != null) {
+            return raced;
+        }
+        cachedRegions.put(regionId, newRegion);
+        return newRegion;
     }
 
     public void tryLoadFromDisk(int regionX, int regionZ) {
-        getOrCreateRegion(regionX, regionZ);
+        queueRegionLoad(regionX, regionZ);
+    }
+
+    private void queueRegionLoad(int regionX, int regionZ) {
+        if (!isRegionInWorld(regionX, regionZ)) {
+            return;
+        }
+        long regionId = getRegionID(regionX, regionZ);
+        synchronized (this) {
+            if (cachedRegions.containsKey(regionId)) {
+                return;
+            }
+        }
+        if (queuedRegionLoads.add(regionId)) {
+            regionLoadQueue.add(new RegionLoadRequest(regionX, regionZ, regionId));
+        }
+    }
+
+    private void awaitRegionLoadBudget() throws InterruptedException {
+        long startupDelayMillis = TimeUnit.SECONDS.toMillis(Math.max(0L, Baritone.settings().chunkCacheLoadDelaySeconds.value));
+        long minimumIntervalMillis = Math.max(0L, Baritone.settings().chunkCacheLoadIntervalMS.value);
+        while (true) {
+            long now = System.currentTimeMillis();
+            long earliest = Math.max(this.createdAt + startupDelayMillis, this.nextRegionLoadAt);
+            long remaining = earliest - now;
+            if (remaining <= 0L) {
+                this.nextRegionLoadAt = now + minimumIntervalMillis;
+                return;
+            }
+            Thread.sleep(Math.min(remaining, 50L));
+        }
     }
 
     /**
@@ -325,6 +384,49 @@ public final class CachedWorld implements ICachedWorld, Helper {
                     th.printStackTrace();
                 }
             }
+        }
+    }
+
+    private final class RegionLoaderThread implements Runnable {
+
+        @Override
+        public void run() {
+            while (true) {
+                RegionLoadRequest request = null;
+                try {
+                    request = regionLoadQueue.take();
+                    awaitRegionLoadBudget();
+                    CachedRegion region = new CachedRegion(request.regionX, request.regionZ, dimension, dimensionId);
+                    region.load(directory);
+                    synchronized (CachedWorld.this) {
+                        if (!cachedRegions.containsKey(request.regionId)) {
+                            cachedRegions.put(request.regionId, region);
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                    break;
+                } catch (Throwable th) {
+                    th.printStackTrace();
+                } finally {
+                    if (request != null) {
+                        queuedRegionLoads.remove(request.regionId);
+                    }
+                }
+            }
+        }
+    }
+
+    private static final class RegionLoadRequest {
+
+        private final int regionX;
+        private final int regionZ;
+        private final long regionId;
+
+        private RegionLoadRequest(int regionX, int regionZ, long regionId) {
+            this.regionX = regionX;
+            this.regionZ = regionZ;
+            this.regionId = regionId;
         }
     }
 }

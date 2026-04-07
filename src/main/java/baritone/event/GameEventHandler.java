@@ -90,6 +90,7 @@ public final class GameEventHandler implements IEventBus, Helper {
         ChunkEvent.Type type = event.getType();
 
         Level world = baritone.getPlayerContext().world();
+        LevelChunk chunk = null;
 
         // Whenever the server sends us to another dimension, chunks are unloaded
         // technically after the new world has been loaded, so we perform a check
@@ -98,10 +99,16 @@ public final class GameEventHandler implements IEventBus, Helper {
                 && type == ChunkEvent.Type.UNLOAD
                 && world.getChunkSource().getChunk(event.getX(), event.getZ(), null, false) != null;
 
+        if (event.isPostPopulate()) {
+            chunk = world.getChunk(event.getX(), event.getZ());
+            baritone.getWorldProvider().observeChunk(chunk);
+        }
+
         if (event.isPostPopulate() || isPreUnload) {
+            final LevelChunk observedChunk = chunk;
             baritone.getWorldProvider().ifWorldLoaded(worldData -> {
-                LevelChunk chunk = world.getChunk(event.getX(), event.getZ());
-                worldData.getCachedWorld().queueForPacking(chunk);
+                LevelChunk chunkForPacking = observedChunk != null ? observedChunk : world.getChunk(event.getX(), event.getZ());
+                worldData.getCachedWorld().queueForPacking(chunkForPacking);
             });
         }
 

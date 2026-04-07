@@ -79,7 +79,9 @@ public class Baritone implements IBaritone {
     private final ExploreProcess exploreProcess;
     private final FarmProcess farmProcess;
     private final CowHuntProcess cowHuntProcess;
+    private final HarvestProcess harvestProcess;
     private final InventoryPauserProcess inventoryPauserProcess;
+    private final SentryProcess sentryProcess;
     private final IElytraProcess elytraProcess;
 
     private final PathingControlManager pathingControlManager;
@@ -123,6 +125,10 @@ public class Baritone implements IBaritone {
             this.exploreProcess          = this.registerProcess(ExploreProcess::new);
             this.farmProcess             = this.registerProcess(FarmProcess::new);
             this.cowHuntProcess          = this.registerProcess(CowHuntProcess::new);
+            this.harvestProcess          = this.registerProcess(HarvestProcess::new);
+            this.sentryProcess           = this.registerProcess(SentryProcess::new);
+            this.registerProcess(AutoEatProcess::new);
+            this.registerProcess(HostileCombatProcess::new);
             this.inventoryPauserProcess  = this.registerProcess(InventoryPauserProcess::new);
             this.elytraProcess           = this.registerProcess(ElytraProcess::create);
             this.registerProcess(BackfillProcess::new);
@@ -170,6 +176,11 @@ public class Baritone implements IBaritone {
     }
 
     @Override
+    public SentryProcess getSentryProcess() {
+        return this.sentryProcess;
+    }
+
+    @Override
     public IPlayerContext getPlayerContext() {
         return this.playerContext;
     }
@@ -206,6 +217,10 @@ public class Baritone implements IBaritone {
     @Override
     public FarmProcess getFarmProcess() {
         return this.farmProcess;
+    }
+
+    public HarvestProcess getHarvestProcess() {
+        return this.harvestProcess;
     }
 
     @Override

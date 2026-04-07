@@ -43,6 +43,10 @@ import static baritone.api.command.IBaritoneChatControl.FORCE_COMMAND_PREFIX;
 
 public class ElytraCommand extends Command {
 
+    private static void debug(String message) {
+        System.out.println("[Baritone Elytra DBG] " + message);
+    }
+
     public ElytraCommand(IBaritone baritone) {
         super(baritone, "elytra");
     }
@@ -55,27 +59,37 @@ public class ElytraCommand extends Command {
             logDirect(elytra.isLoaded() ? "yes" : unsupportedSystemMessage());
             return;
         }
-        if (!elytra.isLoaded()) {
+        final boolean inNether = ctx.world().dimension() == Level.NETHER;
+        final boolean inOverworld = ctx.world().dimension() == Level.OVERWORLD;
+        if (inNether && !elytra.isLoaded()) {
             throw new CommandInvalidStateException(unsupportedSystemMessage());
         }
 
         if (!args.hasAny()) {
+            Goal activeGoal = baritone.getPathingBehavior().getGoal();
+            Goal fallbackGoal = customGoalProcess.mostRecentGoal();
+            debug("command start dim=" + ctx.world().dimension() + " activeGoal=" + activeGoal + " fallbackGoal=" + fallbackGoal);
             if (Baritone.settings().elytraTermsAccepted.value) {
-                if (detectOn2b2t()) {
+                if (inNether && detectOn2b2t()) {
                     warn2b2t();
                 }
             } else {
-                gatekeep();
+                gatekeep(inNether);
             }
-            Goal iGoal = customGoalProcess.mostRecentGoal();
+            Goal iGoal = activeGoal;
+            if (activeGoal == null || (activeGoal instanceof baritone.api.pathing.goals.GoalYLevel && fallbackGoal != null)) {
+                iGoal = fallbackGoal;
+            }
             if (iGoal == null) {
                 throw new CommandInvalidStateException("No goal has been set");
             }
-            if (ctx.world().dimension() != Level.NETHER) {
-                throw new CommandInvalidStateException("Only works in the nether");
+            if (!inNether && !inOverworld) {
+                throw new CommandInvalidStateException("Only works in the overworld or nether");
             }
             try {
+                debug("command dispatch pathTo goal=" + iGoal);
                 elytra.pathTo(iGoal);
+                debug("command dispatch complete");
             } catch (IllegalArgumentException ex) {
                 throw new CommandInvalidStateException(ex.getMessage());
             }
@@ -92,6 +106,24 @@ public class ElytraCommand extends Command {
             case "repack": {
                 elytra.repackChunks();
                 logDirect("Queued all loaded chunks for repacking");
+                break;
+            }
+            case "waterdive": {
+                final boolean enabled;
+                if (!args.hasAny()) {
+                    enabled = !Baritone.settings().elytraOverworldWaterDive.value;
+                } else {
+                    final String mode = args.getString().toLowerCase();
+                    if (mode.equals("on") || mode.equals("true") || mode.equals("enable")) {
+                        enabled = true;
+                    } else if (mode.equals("off") || mode.equals("false") || mode.equals("disable")) {
+                        enabled = false;
+                    } else {
+                        throw new CommandInvalidStateException("Usage: elytra waterdive [on|off]");
+                    }
+                }
+                Baritone.settings().elytraOverworldWaterDive.value = enabled;
+                logDirect("Overworld water dive-bomb landings " + (enabled ? "enabled" : "disabled"));
                 break;
             }
             default: {
@@ -125,16 +157,23 @@ public class ElytraCommand extends Command {
         return clippy;
     }
 
-    private void gatekeep() {
+    private void gatekeep(boolean inNether) {
         MutableComponent gatekeep = Component.literal("");
         gatekeep.append("To disable this message, enable the setting elytraTermsAccepted\n");
-        gatekeep.append("Baritone Elytra is an experimental feature. It is only intended for long distance travel in the Nether using fireworks for vanilla boost. It will not work with any other mods (\"hacks\") for non-vanilla boost. ");
-        MutableComponent gatekeep2 = Component.literal("If you want Baritone to attempt to take off from the ground for you, you can enable the elytraAutoJump setting (not advisable on laggy servers!). ");
+        gatekeep.append("Baritone Elytra is an experimental feature for long distance travel using vanilla elytra boost fireworks. It will not work with any other mods (\"hacks\") for non-vanilla boost. ");
+        MutableComponent gatekeep2 = Component.literal("Baritone will attempt grounded takeoff in the overworld by default. In the nether, you can enable elytraAutoJump if you want it to walk to a ledge and jump for you (not advisable on laggy servers!). ");
         gatekeep2.setStyle(gatekeep2.getStyle().withHoverEvent(new HoverEvent.ShowText(Component.literal(Baritone.settings().prefix.value + "set elytraAutoJump true"))));
         gatekeep.append(gatekeep2);
         MutableComponent gatekeep3 = Component.literal("If you want Baritone to go slower, enable the elytraConserveFireworks setting and/or decrease the elytraFireworkSpeed setting. ");
         gatekeep3.setStyle(gatekeep3.getStyle().withHoverEvent(new HoverEvent.ShowText(Component.literal(Baritone.settings().prefix.value + "set elytraConserveFireworks true\n" + Baritone.settings().prefix.value + "set elytraFireworkSpeed 0.6\n(the 0.6 number is just an example, tweak to your liking)"))));
         gatekeep.append(gatekeep3);
+        if (!inNether) {
+            MutableComponent overworld = Component.literal("For overworld travel, elytraOverworldCruiseY controls how high Baritone tries to cruise before descending to land. ");
+            overworld.setStyle(overworld.getStyle().withHoverEvent(new HoverEvent.ShowText(Component.literal(Baritone.settings().prefix.value + "set elytraOverworldCruiseY 224"))));
+            gatekeep.append(overworld);
+            logDirect(gatekeep);
+            return;
+        }
         MutableComponent gatekeep4 = Component.literal("Baritone Elytra ");
         MutableComponent red = Component.literal("wants to know the seed");
         red.setStyle(red.getStyle().withColor(ChatFormatting.RED).withUnderlined(true).withBold(true));
@@ -189,7 +228,10 @@ public class ElytraCommand extends Command {
     public Stream<String> tabComplete(String label, IArgConsumer args) throws CommandException {
         TabCompleteHelper helper = new TabCompleteHelper();
         if (args.hasExactlyOne()) {
-            helper.append("reset", "repack", "supported");
+            helper.append("reset", "repack", "supported", "waterdive");
+        }
+        if (args.hasExactly(2) && "waterdive".equals(args.peekString())) {
+            helper.append("on", "off");
         }
         return helper.filterPrefix(args.getString()).stream();
     }
@@ -202,12 +244,13 @@ public class ElytraCommand extends Command {
     @Override
     public List<String> getLongDesc() {
         return Arrays.asList(
-                "The elytra command tells baritone to, in the nether, automatically fly to the current goal.",
+                "The elytra command tells baritone to automatically fly to the current goal in the overworld or nether.",
                 "",
                 "Usage:",
                 "> elytra - fly to the current goal",
                 "> elytra reset - Resets the state of the process, but will try to keep flying to the same goal.",
                 "> elytra repack - Queues all of the chunks in render distance to be given to the native library.",
+                "> elytra waterdive [on|off] - Toggle water dive-bomb landings near the goal in the overworld.",
                 "> elytra supported - Tells you if baritone ships a native library that is compatible with your PC."
         );
     }

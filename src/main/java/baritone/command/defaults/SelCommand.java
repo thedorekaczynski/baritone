@@ -19,6 +19,7 @@ package baritone.command.defaults;
 
 import baritone.Baritone;
 import baritone.api.IBaritone;
+import baritone.api.cache.IWorldData;
 import baritone.api.command.Command;
 import baritone.api.command.argument.IArgConsumer;
 import baritone.api.command.datatypes.ForAxis;
@@ -39,12 +40,16 @@ import baritone.api.selection.ISelectionManager;
 import baritone.api.utils.BetterBlockPos;
 import baritone.api.utils.BlockOptionalMeta;
 import baritone.api.utils.BlockOptionalMetaLookup;
+import baritone.api.utils.BlockUtils;
 import baritone.utils.BlockStateInterface;
 import baritone.utils.IRenderer;
 import baritone.utils.schematic.StaticSchematic;
 import com.mojang.blaze3d.vertex.BufferBuilder;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Vec3i;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
@@ -107,6 +112,57 @@ public class SelCommand extends Command {
             args.requireMax(0);
             pos1 = null;
             logDirect(String.format("Removed %d selections", manager.removeAllSelections().length));
+        } else if (action == Action.SAVE) {
+            args.requireExactly(1);
+            String name = validatedSelectionName(args.getString());
+            ISelection[] selections = manager.getSelections();
+            if (selections.length == 0) {
+                throw new CommandInvalidStateException("No selections to save");
+            }
+            IWorldData world = requireWorldData();
+            boolean replacing = world.getSavedSelection(name) != null;
+            world.saveSelection(name, selections);
+            logDirect(String.format("%s saved selection '%s' with %d entr%s",
+                    replacing ? "Updated" : "Saved",
+                    name,
+                    selections.length,
+                    selections.length == 1 ? "y" : "ies"));
+        } else if (action == Action.LOAD) {
+            args.requireExactly(1);
+            String name = validatedSelectionName(args.getString());
+            ISelection[] saved = requireSavedSelection(name);
+            int removed = manager.removeAllSelections().length;
+            for (ISelection selection : saved) {
+                manager.addSelection(selection);
+            }
+            pos1 = null;
+            logDirect(String.format("Loaded %d saved selection entr%s from '%s' (replaced %d current entr%s)",
+                    saved.length,
+                    saved.length == 1 ? "y" : "ies",
+                    name,
+                    removed,
+                    removed == 1 ? "y" : "ies"));
+        } else if (action == Action.LIST) {
+            args.requireMax(0);
+            IWorldData world = requireWorldData();
+            Set<String> names = world.getSavedSelectionNames();
+            if (names.isEmpty()) {
+                throw new CommandInvalidStateException("No saved selections");
+            }
+            logDirect("Saved selections:");
+            for (String name : names) {
+                ISelection[] saved = world.getSavedSelection(name);
+                int count = saved == null ? 0 : saved.length;
+                logDirect(String.format("%s (%d entr%s)", name, count, count == 1 ? "y" : "ies"));
+            }
+        } else if (action == Action.DELETE) {
+            args.requireExactly(1);
+            String name = validatedSelectionName(args.getString());
+            IWorldData world = requireWorldData();
+            if (!world.removeSavedSelection(name)) {
+                throw new CommandInvalidStateException("No saved selection named '" + name + "'");
+            }
+            logDirect(String.format("Deleted saved selection '%s'", name));
         } else if (action == Action.FARM || action == Action.RANCH) {
             args.requireMax(0);
             ISelection[] selections = manager.getSelections();
@@ -138,6 +194,15 @@ public class SelCommand extends Command {
                     logDirect("Undid pos2");
                 }
             }
+        } else if (action == Action.LIGHTAURA) {
+            BlockOptionalMeta replaces = args.getDatatypeFor(ForBlockOptionalMeta.INSTANCE);
+            BlockOptionalMeta type = args.getDatatypeFor(ForBlockOptionalMeta.INSTANCE);
+            args.requireMax(0);
+            ISelection[] selections = manager.getSelections();
+            if (selections.length == 0) {
+                throw new CommandInvalidStateException("No selections");
+            }
+            executeLightAura(selections, replaces, type);
         } else if (action.isFillAction()) {
             BlockOptionalMeta type = action == Action.CLEARAREA
                     ? new BlockOptionalMeta(Blocks.AIR)
@@ -300,6 +365,13 @@ public class SelCommand extends Command {
                     if (args.hasAtMost(3)) {
                         return args.tabCompleteDatatype(RelativeBlockPos.INSTANCE);
                     }
+                } else if (action == Action.LOAD || action == Action.DELETE) {
+                    if (args.hasExactlyOne()) {
+                        String prefix = args.peekString().toLowerCase(Locale.US);
+                        return requireWorldData().getSavedSelectionNames().stream()
+                                .filter(name -> name.toLowerCase(Locale.US).startsWith(prefix))
+                                .sorted(String.CASE_INSENSITIVE_ORDER);
+                    }
                 } else if (action.isFillAction()) {
                     if (args.hasExactlyOne() || action == Action.REPLACE) {
                         while (args.has(2)) {
@@ -310,6 +382,11 @@ public class SelCommand extends Command {
                         args.get();
                         return args.tabCompleteDatatype(ForAxis.INSTANCE);
                     }
+                } else if (action == Action.LIGHTAURA) {
+                    while (args.has(2)) {
+                        args.get();
+                    }
+                    return args.tabCompleteDatatype(ForBlockOptionalMeta.INSTANCE);
                 } else if (action == Action.EXPAND || action == Action.CONTRACT || action == Action.SHIFT) {
                     if (args.hasExactlyOne()) {
                         return new TabCompleteHelper()
@@ -340,6 +417,7 @@ public class SelCommand extends Command {
                 "The sel command allows you to manipulate Baritone's selections, similarly to WorldEdit.",
                 "",
                 "Using these selections, you can clear areas, fill them with blocks, or something else.",
+                "Selections are normally temporary, but you can persist named ones per world with save/load.",
                 "",
                 "The expand/contract/shift commands use a kind of selector to choose which selections to target. Supported ones are a/all, n/newest, and o/oldest.",
                 "",
@@ -350,6 +428,10 @@ public class SelCommand extends Command {
                 "> sel pos2/p2/2 <x> <y> <z> - Set position 2 to a relative position.",
                 "",
                 "> sel clear/c - Clear the selection.",
+                "> sel save <name> - Save the current selections under a persistent per-world name.",
+                "> sel load <name> - Replace the current selections with a saved one.",
+                "> sel list/ls - List saved selection names for this world.",
+                "> sel delete/del <name> - Delete a saved selection by name.",
                 "> sel farm - Save the current selections as a protected cowhunt farm zone.",
                 "> sel ranch - Save the current selections as a protected cowhunt ranch zone.",
                 "> sel unfarm - Remove the saved protected cowhunt farm zone.",
@@ -364,6 +446,7 @@ public class SelCommand extends Command {
                 "> sel hcylinder/hcyl [block] <axis> - The same as cylinder, but hollow.",
                 "> sel cleararea/ca - Basically 'set air'.",
                 "> sel replace/r <blocks...> <with> - Replaces blocks with another block.",
+                "> sel lightaura/la <replace> <with> - Sparse flush lighting over a selected flat area to prevent mob spawns, with a need/have/short count.",
                 "> sel copy/cp <x> <y> <z> - Copy the selected area relative to the specified or your position.",
                 "> sel paste/p <x> <y> <z> - Build the copied area relative to the specified or your position.",
                 "",
@@ -373,10 +456,132 @@ public class SelCommand extends Command {
         );
     }
 
+    private void executeLightAura(ISelection[] selections, BlockOptionalMeta replaces, BlockOptionalMeta type) throws CommandInvalidStateException {
+        BlockState lightState = type.getAnyBlockState();
+        if (lightState == null) {
+            throw new CommandInvalidStateException("Invalid light block");
+        }
+        int lightEmission = lightState.getLightEmission();
+        if (lightEmission <= 0) {
+            throw new CommandInvalidStateException("Target block does not emit light");
+        }
+        for (ISelection selection : selections) {
+            if (selection.size().getY() != 1) {
+                throw new CommandInvalidStateException("lightaura requires 1-block-tall selections");
+            }
+        }
+
+        BlockStateInterface bsi = new BlockStateInterface(ctx);
+        List<BlockPos> candidates = new ArrayList<>();
+        for (ISelection selection : selections) {
+            BetterBlockPos min = selection.min();
+            Vec3i size = selection.size();
+            for (int x = 0; x < size.getX(); x++) {
+                for (int z = 0; z < size.getZ(); z++) {
+                    BlockPos pos = new BlockPos(min.x + x, min.y, min.z + z);
+                    if (replaces.matches(bsi.get0(pos))) {
+                        candidates.add(pos.immutable());
+                    }
+                }
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            throw new CommandInvalidStateException("Selection has no matching blocks to replace");
+        }
+
+        int requiredBlockLight = 1;
+        List<BlockPos> uncovered = new ArrayList<>();
+        for (BlockPos pos : candidates) {
+            if (!coveredByExistingLight(pos, lightEmission, requiredBlockLight)) {
+                uncovered.add(pos);
+            }
+        }
+
+        List<BlockPos> chosen = new ArrayList<>();
+        int maxDistance = Math.max(0, lightEmission - requiredBlockLight);
+        while (!uncovered.isEmpty()) {
+            BlockPos best = null;
+            int bestCoverage = 0;
+            for (BlockPos candidate : candidates) {
+                if (!replaces.matches(bsi.get0(candidate))) {
+                    continue;
+                }
+                if (!canPlaceLightAuraBlock(candidate, lightState)) {
+                    continue;
+                }
+                int coverage = 0;
+                for (BlockPos risk : uncovered) {
+                    if (candidate.distManhattan(risk) <= maxDistance) {
+                        coverage++;
+                    }
+                }
+                if (coverage > bestCoverage) {
+                    best = candidate;
+                    bestCoverage = coverage;
+                }
+            }
+            if (best == null || bestCoverage == 0) {
+                throw new CommandInvalidStateException("Unable to find enough valid light positions in the selection");
+            }
+            chosen.add(best);
+            BlockPos chosenPos = best;
+            uncovered.removeIf(risk -> chosenPos.distManhattan(risk) <= maxDistance);
+        }
+
+        if (chosen.isEmpty()) {
+            logDirect("No additional lights needed.");
+            return;
+        }
+
+        String blockName = BlockUtils.blockToString(type.getBlock());
+        int available = ctx.player().getInventory().getNonEquipmentItems().stream()
+                .filter(type::matches)
+                .mapToInt(ItemStack::getCount)
+                .sum();
+        if (available >= chosen.size()) {
+            logDirect(String.format("Need %d %s, have %d.", chosen.size(), blockName, available));
+        } else {
+            logDirect(String.format("Need %d %s, have %d, short %d.", chosen.size(), blockName, available, chosen.size() - available));
+        }
+
+        BetterBlockPos origin = new BetterBlockPos(
+                chosen.stream().mapToInt(BlockPos::getX).min().orElseThrow(),
+                chosen.stream().mapToInt(BlockPos::getY).min().orElseThrow(),
+                chosen.stream().mapToInt(BlockPos::getZ).min().orElseThrow()
+        );
+        CompositeSchematic composite = new CompositeSchematic(0, 0, 0);
+        StaticSchematic lightBlock = new StaticSchematic(new BlockState[][][]{{{lightState}}});
+        for (BlockPos pos : chosen) {
+            composite.put(lightBlock, pos.getX() - origin.x, pos.getY() - origin.y, pos.getZ() - origin.z);
+        }
+        baritone.getBuilderProcess().build("LightAura", composite, origin);
+        logDirect("Lighting now");
+    }
+
+    private boolean canPlaceLightAuraBlock(BlockPos pos, BlockState lightState) {
+        BlockState current = ctx.world().getBlockState(pos);
+        if (current.getDestroySpeed(ctx.world(), pos) < 0.0F) {
+            return false;
+        }
+        if (!ctx.world().getFluidState(pos).isEmpty() || !ctx.world().getFluidState(pos.above()).isEmpty()) {
+            return false;
+        }
+        return lightState.canSurvive(ctx.world(), pos);
+    }
+
+    private boolean coveredByExistingLight(BlockPos targetPos, int lightEmission, int requiredBlockLight) {
+        return ctx.world().getBrightness(LightLayer.BLOCK, targetPos) >= requiredBlockLight;
+    }
+
     enum Action {
         POS1("pos1", "p1", "1"),
         POS2("pos2", "p2", "2"),
         CLEAR("clear", "c"),
+        SAVE("save"),
+        LOAD("load"),
+        LIST("list", "ls"),
+        DELETE("delete", "del", "remove", "rm"),
         FARM("farm"),
         RANCH("ranch"),
         UNFARM("unfarm"),
@@ -391,6 +596,7 @@ public class SelCommand extends Command {
         HCYLINDER("hcylinder", "hcyl"),
         CLEARAREA("cleararea", "ca"),
         REPLACE("replace", "r"),
+        LIGHTAURA("lightaura", "la"),
         EXPAND("expand", "ex"),
         COPY("copy", "cp"),
         PASTE("paste", "p"),
@@ -468,5 +674,32 @@ public class SelCommand extends Command {
             }
             return names.toArray(new String[0]);
         }
+    }
+
+    private IWorldData requireWorldData() throws CommandInvalidStateException {
+        IWorldData world = baritone.getWorldProvider().getCurrentWorld();
+        if (world == null) {
+            throw new CommandInvalidStateException("No world loaded");
+        }
+        return world;
+    }
+
+    private ISelection[] requireSavedSelection(String name) throws CommandInvalidStateException {
+        ISelection[] saved = requireWorldData().getSavedSelection(name);
+        if (saved == null) {
+            throw new CommandInvalidStateException("No saved selection named '" + name + "'");
+        }
+        if (saved.length == 0) {
+            throw new CommandInvalidStateException("Saved selection '" + name + "' is empty");
+        }
+        return saved;
+    }
+
+    private static String validatedSelectionName(String raw) throws CommandInvalidStateException {
+        String name = raw.trim();
+        if (name.isEmpty()) {
+            throw new CommandInvalidStateException("Selection name cannot be empty");
+        }
+        return name;
     }
 }

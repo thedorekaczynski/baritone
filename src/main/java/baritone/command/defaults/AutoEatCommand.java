@@ -17,6 +17,7 @@
 
 package baritone.command.defaults;
 
+import baritone.Baritone;
 import baritone.api.IBaritone;
 import baritone.api.command.Command;
 import baritone.api.command.argument.IArgConsumer;
@@ -28,29 +29,43 @@ import java.util.List;
 import java.util.Locale;
 import java.util.stream.Stream;
 
-public class CowHuntCommand extends Command {
+public final class AutoEatCommand extends Command {
 
-    public CowHuntCommand(IBaritone baritone) {
-        super(baritone, "cowhunt");
+    public AutoEatCommand(IBaritone baritone) {
+        super(baritone, "autoeat", "ae");
     }
 
     @Override
     public void execute(String label, IArgConsumer args) throws CommandException {
         args.requireMax(1);
         if (!args.hasAny()) {
-            baritone.getCowHuntProcess().hunt();
+            boolean enabled = !Baritone.settings().autoEat.value;
+            Baritone.settings().autoEat.value = enabled;
+            logDirect("Auto eat " + (enabled ? "enabled" : "disabled"));
             return;
         }
         String subcommand = args.getString().toLowerCase(Locale.US);
         switch (subcommand) {
+            case "on":
             case "start":
-                baritone.getCowHuntProcess().hunt();
+                Baritone.settings().autoEat.value = true;
+                logDirect("Auto eat enabled");
+                break;
+            case "off":
+            case "stop":
+                Baritone.settings().autoEat.value = false;
+                logDirect("Auto eat disabled");
                 break;
             case "status":
-                logDirect(baritone.getCowHuntProcess().status());
+                logDirect(String.format(
+                        Locale.US,
+                        "Auto eat is %s. Hunger threshold %d, using hotbar food only while a Baritone operation is running",
+                        Baritone.settings().autoEat.value ? "enabled" : "disabled",
+                        Baritone.settings().autoEatHungerThreshold.value
+                ));
                 break;
             default:
-                throw new CommandInvalidStateException("Usage: cowhunt [start|status]");
+                throw new CommandInvalidStateException("Usage: autoeat [on|off|status]");
         }
     }
 
@@ -58,27 +73,28 @@ public class CowHuntCommand extends Command {
     public Stream<String> tabComplete(String label, IArgConsumer args) throws CommandException {
         if (args.hasExactlyOne()) {
             String prefix = args.getString().toLowerCase(Locale.US);
-            return Stream.of("start", "status").filter(option -> option.startsWith(prefix));
+            return Stream.of("on", "off", "status").filter(option -> option.startsWith(prefix));
         }
         return Stream.empty();
     }
 
     @Override
     public String getShortDesc() {
-        return "Hunt cows while avoiding #sel protected farm areas";
+        return "Pause pathing to eat hotbar food at low hunger";
     }
 
     @Override
     public List<String> getLongDesc() {
         return Arrays.asList(
-                "The cowhunt command makes Baritone roam surface terrain, find cows, kill them, and pick up beef/leather.",
-                "Any #sel area is treated as a protected farm zone, so cows inside those selections are ignored.",
+                "The autoeat command toggles a temporary pathing pause for eating.",
+                "When enabled, Baritone pauses only while a Baritone operation is already running, swaps to hotbar food, eats at 5 hunger, then resumes.",
+                "It does not pull food from main inventory slots.",
                 "",
                 "Usage:",
-                "> cowhunt - start hunting cows.",
-                "> cowhunt start - start hunting cows.",
-                "> cowhunt status - print the current or last run summary.",
-                "> stop - stop the hunt and print a summary."
+                "> autoeat - toggle auto eat.",
+                "> autoeat on - enable auto eat.",
+                "> autoeat off - disable auto eat.",
+                "> autoeat status - show current settings."
         );
     }
 }

@@ -22,14 +22,31 @@ import baritone.api.command.Command;
 import baritone.api.command.argument.IArgConsumer;
 import baritone.api.command.exception.CommandException;
 import baritone.api.pathing.goals.Goal;
+import baritone.api.pathing.goals.GoalComposite;
 import baritone.api.pathing.goals.GoalBlock;
 import baritone.api.utils.BetterBlockPos;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import net.minecraft.world.level.block.AirBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
 
 public class SurfaceCommand extends Command {
+
+    private static final int SURFACE_SEARCH_RADIUS = 96;
+    private static final int SURFACE_SEARCH_RADIUS_CHUNKS = SURFACE_SEARCH_RADIUS / 16;
+    private static final int MAX_SURFACE_CANDIDATES = 64;
+    private static final int[][] SURFACE_CHUNK_SAMPLES = {
+            {8, 8},
+            {4, 4},
+            {12, 4},
+            {4, 12},
+            {12, 12}
+    };
 
     protected SurfaceCommand(IBaritone baritone) {
         super(baritone, "surface", "top");
@@ -38,27 +55,22 @@ public class SurfaceCommand extends Command {
     @Override
     public void execute(String label, IArgConsumer args) throws CommandException {
         final BetterBlockPos playerPos = ctx.playerFeet();
-        final int surfaceLevel = ctx.world().getSeaLevel();
-        final int worldHeight = ctx.world().getHeight();
-
-        // Ensure this command will not run if you are above the surface level and the block above you is air
-        // As this would imply that your are already on the open surface
-        if (playerPos.getY() > surfaceLevel && ctx.world().getBlockState(playerPos.above()).getBlock() instanceof AirBlock) {
+        if (isOpenToSky(playerPos)) {
             logDirect("Already at surface");
             return;
         }
-
-        final int startingYPos = Math.max(playerPos.getY(), surfaceLevel);
-
-        for (int currentIteratedY = startingYPos; currentIteratedY < worldHeight; currentIteratedY++) {
-            final BetterBlockPos newPos = new BetterBlockPos(playerPos.getX(), currentIteratedY, playerPos.getZ());
-
-            if (!(ctx.world().getBlockState(newPos).getBlock() instanceof AirBlock) && newPos.getY() > playerPos.getY()) {
-                Goal goal = new GoalBlock(newPos.above());
-                logDirect(String.format("Going to: %s", goal.toString()));
-                baritone.getCustomGoalProcess().setGoalAndPath(goal);
-                return;
-            }
+        List<BetterBlockPos> candidates = findSurfaceCandidates(playerPos);
+        if (!candidates.isEmpty()) {
+            Goal goal = new GoalComposite(candidates.stream().map(GoalBlock::new).toArray(Goal[]::new));
+            logDirect(String.format("Going to surface via %d nearby exit%s", candidates.size(), candidates.size() == 1 ? "" : "s"));
+            baritone.getCustomGoalProcess().setGoalAndPath(goal);
+            return;
+        }
+        Goal fallback = surfaceAboveCurrentColumn(playerPos);
+        if (fallback != null) {
+            logDirect(String.format("No nearby open-sky exit found, climbing current column via %s", fallback));
+            baritone.getCustomGoalProcess().setGoalAndPath(fallback);
+            return;
         }
         logDirect("No higher location found");
     }
@@ -76,13 +88,100 @@ public class SurfaceCommand extends Command {
     @Override
     public List<String> getLongDesc() {
         return Arrays.asList(
-                "The surface/top command tells Baritone to head towards the closest surface-like area.",
+                "The surface/top command looks for nearby loaded open-sky positions and paths to the closest one.",
                 "",
-                "This can be the surface or the highest available air space, depending on circumstances.",
+                "If no nearby exit is found, it falls back to climbing the current column.",
                 "",
                 "Usage:",
                 "> surface - Used to get out of caves, mines, ...",
                 "> top - Used to get out of caves, mines, ..."
         );
+    }
+
+    private List<BetterBlockPos> findSurfaceCandidates(BetterBlockPos playerPos) {
+        int originChunkX = playerPos.x >> 4;
+        int originChunkZ = playerPos.z >> 4;
+        LinkedHashSet<BetterBlockPos> candidates = new LinkedHashSet<>();
+        for (int radius = 0; radius <= SURFACE_SEARCH_RADIUS_CHUNKS && candidates.size() < MAX_SURFACE_CANDIDATES; radius++) {
+            addChunkRingCandidates(originChunkX, originChunkZ, radius, playerPos, candidates);
+        }
+        return candidates.stream()
+                .sorted(Comparator.comparingDouble(playerPos::distanceSq))
+                .collect(Collectors.toList());
+    }
+
+    private void addChunkRingCandidates(int originChunkX, int originChunkZ, int radius, BetterBlockPos playerPos, LinkedHashSet<BetterBlockPos> candidates) {
+        if (radius == 0) {
+            addChunkCandidates(originChunkX, originChunkZ, playerPos, candidates);
+            return;
+        }
+        for (int chunkX = originChunkX - radius; chunkX <= originChunkX + radius && candidates.size() < MAX_SURFACE_CANDIDATES; chunkX++) {
+            addChunkCandidates(chunkX, originChunkZ - radius, playerPos, candidates);
+            addChunkCandidates(chunkX, originChunkZ + radius, playerPos, candidates);
+        }
+        for (int chunkZ = originChunkZ - radius + 1; chunkZ <= originChunkZ + radius - 1 && candidates.size() < MAX_SURFACE_CANDIDATES; chunkZ++) {
+            addChunkCandidates(originChunkX - radius, chunkZ, playerPos, candidates);
+            addChunkCandidates(originChunkX + radius, chunkZ, playerPos, candidates);
+        }
+    }
+
+    private void addChunkCandidates(int chunkX, int chunkZ, BetterBlockPos playerPos, LinkedHashSet<BetterBlockPos> candidates) {
+        if (!ctx.world().hasChunk(chunkX, chunkZ)) {
+            return;
+        }
+        int baseX = chunkX << 4;
+        int baseZ = chunkZ << 4;
+        for (int[] sample : SURFACE_CHUNK_SAMPLES) {
+            BetterBlockPos candidate = surfaceCandidateAt(baseX + sample[0], baseZ + sample[1]);
+            if (candidate == null || candidate.getY() <= playerPos.getY() || playerPos.distSqr(candidate) > SURFACE_SEARCH_RADIUS * SURFACE_SEARCH_RADIUS) {
+                continue;
+            }
+            candidates.add(candidate);
+            if (candidates.size() >= MAX_SURFACE_CANDIDATES) {
+                return;
+            }
+        }
+    }
+
+    private BetterBlockPos surfaceCandidateAt(int x, int z) {
+        int chunkX = x >> 4;
+        int chunkZ = z >> 4;
+        if (!ctx.world().hasChunk(chunkX, chunkZ)) {
+            return null;
+        }
+        int y = ctx.world().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+        BetterBlockPos feet = new BetterBlockPos(x, y, z);
+        if (!isSurfaceCandidate(feet)) {
+            return null;
+        }
+        return feet;
+    }
+
+    private boolean isSurfaceCandidate(BetterBlockPos feet) {
+        if (!isOpenToSky(feet)) {
+            return false;
+        }
+        BetterBlockPos ground = feet.below();
+        BlockState groundState = ctx.world().getBlockState(ground);
+        return !groundState.isAir() && ctx.world().getFluidState(feet).isEmpty() && ctx.world().getFluidState(ground).isEmpty();
+    }
+
+    private boolean isOpenToSky(BetterBlockPos pos) {
+        return ctx.world().canSeeSky(pos)
+                && ctx.world().getBlockState(pos).getBlock() instanceof AirBlock
+                && ctx.world().getBlockState(pos.above()).getBlock() instanceof AirBlock;
+    }
+
+    private Goal surfaceAboveCurrentColumn(BetterBlockPos playerPos) {
+        final int surfaceLevel = ctx.world().getSeaLevel();
+        final int worldHeight = ctx.world().getHeight();
+        final int startingYPos = Math.max(playerPos.getY(), surfaceLevel);
+        for (int currentIteratedY = startingYPos; currentIteratedY < worldHeight; currentIteratedY++) {
+            BetterBlockPos newPos = new BetterBlockPos(playerPos.getX(), currentIteratedY, playerPos.getZ());
+            if (!(ctx.world().getBlockState(newPos).getBlock() instanceof AirBlock) && newPos.getY() > playerPos.getY()) {
+                return new GoalBlock(newPos.above());
+            }
+        }
+        return null;
     }
 }

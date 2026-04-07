@@ -47,13 +47,13 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.Fireworks;
 import net.minecraft.world.level.ChunkPos;
-import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.AirBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkSource;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.AABB;
-import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 import java.awt.*;
@@ -67,6 +67,10 @@ import static baritone.utils.BaritoneMath.fastCeil;
 import static baritone.utils.BaritoneMath.fastFloor;
 
 public final class ElytraBehavior implements Helper {
+    private static void debug(String message) {
+        System.out.println("[Baritone Elytra DBG] " + message);
+    }
+
     private final Baritone baritone;
     private final IPlayerContext ctx;
 
@@ -78,7 +82,8 @@ public final class ElytraBehavior implements Helper {
     private List<BetterBlockPos> visiblePath;
 
     // :sunglasses:
-    public final NetherPathfinderContext context;
+    private final boolean useNetherPathfinder;
+    private final NetherPathfinderContext context;
     public final PathManager pathManager;
     private final ElytraProcess process;
 
@@ -108,10 +113,13 @@ public final class ElytraBehavior implements Helper {
     private final BlockStateOctreeInterface boi;
     public final BetterBlockPos destination;
     private final boolean appendDestination;
+    private final BetterBlockPos landingTarget;
+    private final boolean waterLandingTarget;
 
     private final ExecutorService solverExecutor;
     private Future<Solution> solver;
     private Solution pendingSolution;
+    private Solution lastSolution;
     private boolean solveNextTick;
 
     private long timeLastCacheCull = 0L;
@@ -120,7 +128,8 @@ public final class ElytraBehavior implements Helper {
     private int invTickCountdown = 0;
     private final Queue<Runnable> invTransactionQueue = new LinkedList<>();
 
-    public ElytraBehavior(Baritone baritone, ElytraProcess process, BlockPos destination, boolean appendDestination) {
+    public ElytraBehavior(Baritone baritone, ElytraProcess process, BlockPos destination, boolean appendDestination, BetterBlockPos landingTarget) {
+        debug("behavior ctor start dim=" + baritone.getPlayerContext().world().dimension() + " dest=" + destination + " append=" + appendDestination);
         this.baritone = baritone;
         this.ctx = baritone.getPlayerContext();
         this.clearLines = new CopyOnWriteArrayList<>();
@@ -129,11 +138,15 @@ public final class ElytraBehavior implements Helper {
         this.process = process;
         this.destination = new BetterBlockPos(destination);
         this.appendDestination = appendDestination;
+        this.landingTarget = landingTarget;
+        this.waterLandingTarget = landingTarget != null && !ctx.world().getBlockState(landingTarget).getFluidState().isEmpty();
         this.solverExecutor = Executors.newSingleThreadExecutor();
         this.nextTickBoostCounter = new int[2];
-
-        this.context = new NetherPathfinderContext(Baritone.settings().elytraNetherSeed.value);
-        this.boi = new BlockStateOctreeInterface(context);
+        this.useNetherPathfinder = ctx.world().dimension() == Level.NETHER;
+        this.context = this.useNetherPathfinder ? new NetherPathfinderContext(Baritone.settings().elytraNetherSeed.value) : null;
+        this.boi = this.context != null ? new BlockStateOctreeInterface(this.context) : null;
+        this.bsi = new BlockStateInterface(ctx);
+        debug("behavior ctor complete useNetherPathfinder=" + this.useNetherPathfinder);
     }
 
     public final class PathManager {
@@ -173,6 +186,7 @@ public final class ElytraBehavior implements Helper {
         }
 
         public CompletableFuture<Void> pathToDestination(final BlockPos from) {
+            debug("pathToDestination from=" + from + " to=" + ElytraBehavior.this.destination + " useNether=" + ElytraBehavior.this.useNetherPathfinder);
             final long start = System.nanoTime();
             return this.path0(from, ElytraBehavior.this.destination, UnaryOperator.identity())
                     .thenRun(() -> {
@@ -268,7 +282,7 @@ public final class ElytraBehavior implements Helper {
 
         private void setPath(final UnpackedSegment segment) {
             List<BetterBlockPos> path = segment.collect();
-            if (ElytraBehavior.this.appendDestination) {
+            if (ElytraBehavior.this.appendDestination && ElytraBehavior.this.useNetherPathfinder) {
                 BlockPos dest = ElytraBehavior.this.destination;
                 BlockPos last = !path.isEmpty() ? path.get(path.size() - 1) : null;
                 if (last != null && ElytraBehavior.this.clearView(Vec3.atLowerCornerOf(dest), Vec3.atLowerCornerOf(last), false)) {
@@ -295,10 +309,24 @@ public final class ElytraBehavior implements Helper {
 
         // mickey resigned
         private CompletableFuture<Void> path0(BlockPos src, BlockPos dst, UnaryOperator<UnpackedSegment> operator) {
-            return ElytraBehavior.this.context.pathFindAsync(src, dst)
-                    .thenApply(UnpackedSegment::from)
-                    .thenApply(operator)
-                    .thenAcceptAsync(this::setPath, ctx.minecraft()::execute);
+            debug("path0 start src=" + src + " dst=" + dst + " useNether=" + ElytraBehavior.this.useNetherPathfinder);
+            if (ElytraBehavior.this.useNetherPathfinder) {
+                return ElytraBehavior.this.context.pathFindAsync(src, dst)
+                        .thenApply(UnpackedSegment::from)
+                        .thenApply(operator)
+                        .thenAcceptAsync(this::setPath, ctx.minecraft()::execute);
+            }
+            try {
+                debug("path0 buildOverworldSegment begin");
+                this.setPath(operator.apply(ElytraBehavior.this.buildOverworldSegment(src, dst)));
+                debug("path0 buildOverworldSegment complete pathSize=" + this.path.size());
+                return CompletableFuture.completedFuture(null);
+            } catch (Exception ex) {
+                debug("path0 buildOverworldSegment failed " + ex);
+                CompletableFuture<Void> failed = new CompletableFuture<>();
+                failed.completeExceptionally(ex);
+                return failed;
+            }
         }
 
         private void pathfindAroundObstacles() {
@@ -308,7 +336,7 @@ public final class ElytraBehavior implements Helper {
 
             int rangeStartIncl = playerNear;
             int rangeEndExcl = playerNear;
-            while (rangeEndExcl < path.size() && context.hasChunk(ChunkPos.containing(path.get(rangeEndExcl)))) {
+            while (rangeEndExcl < path.size() && ElytraBehavior.this.hasPathInformation(path.get(rangeEndExcl))) {
                 rangeEndExcl++;
             }
             // rangeEndExcl now represents an index either not in the path, or just outside render distance
@@ -374,7 +402,7 @@ public final class ElytraBehavior implements Helper {
             }
 
             final int last = this.path.size() - 1;
-            if (!this.completePath && ctx.world().isLoaded(this.path.get(last))) {
+            if (!this.completePath && ElytraBehavior.this.hasPathInformation(this.path.get(last))) {
                 this.pathNextSegment(last);
             }
         }
@@ -387,22 +415,22 @@ public final class ElytraBehavior implements Helper {
             int index = this.playerNear;
             final BetterBlockPos pos = ctx.playerFeet();
             for (int i = index; i >= Math.max(index - 1000, 0); i -= 10) {
-                if (path.get(i).distanceSq(pos) < path.get(index).distanceSq(pos)) {
+                if (ElytraBehavior.this.pathDistanceSq(path.get(i), pos) < ElytraBehavior.this.pathDistanceSq(path.get(index), pos)) {
                     index = i; // intentional: this changes the bound of the loop
                 }
             }
             for (int i = index; i < Math.min(index + 1000, path.size()); i += 10) {
-                if (path.get(i).distanceSq(pos) < path.get(index).distanceSq(pos)) {
+                if (ElytraBehavior.this.pathDistanceSq(path.get(i), pos) < ElytraBehavior.this.pathDistanceSq(path.get(index), pos)) {
                     index = i; // intentional: this changes the bound of the loop
                 }
             }
             for (int i = index; i >= Math.max(index - 50, 0); i--) {
-                if (path.get(i).distanceSq(pos) < path.get(index).distanceSq(pos)) {
+                if (ElytraBehavior.this.pathDistanceSq(path.get(i), pos) < ElytraBehavior.this.pathDistanceSq(path.get(index), pos)) {
                     index = i; // intentional: this changes the bound of the loop
                 }
             }
             for (int i = index; i < Math.min(index + 50, path.size()); i++) {
-                if (path.get(i).distanceSq(pos) < path.get(index).distanceSq(pos)) {
+                if (ElytraBehavior.this.pathDistanceSq(path.get(i), pos) < ElytraBehavior.this.pathDistanceSq(path.get(index), pos)) {
                     index = i; // intentional: this changes the bound of the loop
                 }
             }
@@ -412,6 +440,179 @@ public final class ElytraBehavior implements Helper {
         public boolean isComplete() {
             return this.completePath;
         }
+    }
+
+    public boolean usesNetherPathfinder() {
+        return this.useNetherPathfinder;
+    }
+
+    public BetterBlockPos getLandingTarget() {
+        return this.landingTarget;
+    }
+
+    public boolean shouldBeginLanding() {
+        if (this.landingTarget == null) {
+            return false;
+        }
+        final double horizontalSpeed = ctx.player().getDeltaMovement().multiply(1, 0, 1).length();
+        final double downwardSpeed = Math.max(0.0D, -ctx.player().getDeltaMovement().y);
+        final Vec3 landingCenter = this.getLandingPadCenter();
+        final double altitudeAbovePad = landingCenter == null ? 0.0D : Math.max(0.0D, ctx.player().position().y - landingCenter.y);
+        final double leadDistance = this.waterLandingTarget
+                ? Mth.clamp(horizontalSpeed * 32.0D + downwardSpeed * 20.0D + Math.max(0.0D, altitudeAbovePad - 6.0D) * 0.45D + 28.0D, 36.0D, 128.0D)
+                : Mth.clamp(horizontalSpeed * 26.0D + downwardSpeed * 18.0D + Math.max(0.0D, altitudeAbovePad - 6.0D) * 0.35D + 18.0D, 28.0D, 96.0D);
+        return this.horizontalDistanceSq(ctx.player().position(), this.destination.getCenter()) < leadDistance * leadDistance;
+    }
+
+    public long getNetherSeed() {
+        if (this.context == null) {
+            throw new IllegalStateException("No nether context is active");
+        }
+        return this.context.getSeed();
+    }
+
+    private boolean hasPathInformation(BetterBlockPos pos) {
+        if (this.useNetherPathfinder) {
+            return this.context.hasChunk(ChunkPos.containing(pos));
+        }
+        return this.bsi.isLoaded(pos.x, pos.z);
+    }
+
+    private double pathDistanceSq(final BetterBlockPos node, final BetterBlockPos pos) {
+        if (this.useNetherPathfinder) {
+            return node.distanceSq(pos);
+        }
+        final double dx = node.x - pos.x;
+        final double dz = node.z - pos.z;
+        return dx * dx + dz * dz;
+    }
+
+    private UnpackedSegment buildOverworldSegment(final BlockPos src, final BlockPos dst) {
+        debug("buildOverworldSegment start src=" + src + " dst=" + dst);
+        final int minY = ctx.world().dimensionType().minY();
+        final int maxCruiseY = minY + ctx.world().dimensionType().height() - 17;
+        final int requestedCruiseY = Mth.clamp(Baritone.settings().elytraOverworldCruiseY.value, minY + 16, maxCruiseY);
+        debug("buildOverworldSegment requestedCruise=" + requestedCruiseY);
+        List<BetterBlockPos> path = this.buildCruisePath(src, dst, requestedCruiseY, maxCruiseY);
+        debug("buildOverworldSegment pathNodes=" + path.size() + " first=" + (path.isEmpty() ? "null" : path.get(0)) + " last=" + (path.isEmpty() ? "null" : path.get(path.size() - 1)));
+        return new UnpackedSegment(path.stream(), true);
+    }
+
+    private List<BetterBlockPos> buildCruisePath(final BlockPos src, final BlockPos dst, final int requestedCruiseY, final int maxCruiseY) {
+        debug("buildCruisePath start requestedCruiseY=" + requestedCruiseY);
+        final int spacing = Math.max(16, Baritone.settings().elytraOverworldWaypointDistance.value);
+        final List<BetterBlockPos> raw = new ArrayList<>();
+        raw.add(new BetterBlockPos(src));
+
+        final double dx = dst.getX() - src.getX();
+        final double dz = dst.getZ() - src.getZ();
+        final double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
+        if (horizontalDistance > 1.0D) {
+            final double ascentDistance = Math.min(horizontalDistance, Math.max(24.0D, spacing * 0.5D));
+            final double ascentT = Math.min(1.0D, ascentDistance / horizontalDistance);
+            raw.add(this.buildCruiseWaypoint(src, dst, ascentT, requestedCruiseY, maxCruiseY, spacing));
+
+            final double finalApproachDistance = Math.min(horizontalDistance, Math.max(32.0D, spacing));
+            final double cruiseEnd = Math.max(ascentDistance, horizontalDistance - finalApproachDistance);
+            for (double travelled = spacing; travelled < cruiseEnd; travelled += spacing) {
+                final double t = travelled / horizontalDistance;
+                raw.add(this.buildCruiseWaypoint(src, dst, t, requestedCruiseY, maxCruiseY, spacing));
+            }
+
+            final double approachT = horizontalDistance <= finalApproachDistance
+                    ? 1.0D
+                    : Mth.clamp((horizontalDistance - finalApproachDistance) / horizontalDistance, ascentT, 1.0D);
+            raw.add(this.buildApproachWaypoint(src, dst, approachT, horizontalDistance, requestedCruiseY, maxCruiseY, spacing));
+        }
+
+        raw.add(new BetterBlockPos(dst));
+
+        final List<BetterBlockPos> deduped = new ArrayList<>(raw.size());
+        BetterBlockPos previous = null;
+        for (BetterBlockPos point : raw) {
+            if (!Objects.equals(previous, point)) {
+                deduped.add(point);
+                previous = point;
+            }
+        }
+        debug("buildCruisePath complete spacing=" + spacing + " raw=" + raw.size() + " deduped=" + deduped.size());
+        return deduped;
+    }
+
+    private BetterBlockPos buildCruiseWaypoint(final BlockPos src, final BlockPos dst, final double t, final int requestedCruiseY, final int maxCruiseY, final int spacing) {
+        final int x = fastFloor(Mth.lerp(t, src.getX(), dst.getX()));
+        final int z = fastFloor(Mth.lerp(t, src.getZ(), dst.getZ()));
+        final int y = this.computeLocalCruiseY(src, dst, t, requestedCruiseY, maxCruiseY, spacing);
+        return new BetterBlockPos(x, y, z);
+    }
+
+    private BetterBlockPos buildApproachWaypoint(final BlockPos src, final BlockPos dst, final double t, final double horizontalDistance, final int requestedCruiseY, final int maxCruiseY, final int spacing) {
+        final int x = fastFloor(Mth.lerp(t, src.getX(), dst.getX()));
+        final int z = fastFloor(Mth.lerp(t, src.getZ(), dst.getZ()));
+        final int localCruiseY = this.computeLocalCruiseY(src, dst, t, requestedCruiseY, maxCruiseY, spacing);
+        return new BetterBlockPos(x, this.computeOverworldApproachY(dst, localCruiseY, horizontalDistance), z);
+    }
+
+    private int computeLocalCruiseY(final BlockPos src, final BlockPos dst, final double t, final int requestedCruiseY, final int maxCruiseY, final int spacing) {
+        final int minY = ctx.world().dimensionType().minY();
+        final int clearance = Baritone.settings().elytraOverworldTerrainClearance.value;
+        final int localTerrainY = this.sampleLocalTerrainMaxY(src, dst, t, spacing);
+        return Mth.clamp(Math.max(requestedCruiseY, localTerrainY + clearance), minY + 16, maxCruiseY);
+    }
+
+    private int computeOverworldApproachY(final BlockPos dst, final int cruiseY, final double horizontalDistance) {
+        final int approachOffset = Mth.clamp(fastCeil(horizontalDistance * 0.22D), 20, 48);
+        return Math.min(cruiseY, dst.getY() + approachOffset);
+    }
+
+    private int sampleLocalTerrainMaxY(final BlockPos src, final BlockPos dst, final double centerT, final int spacing) {
+        final double dx = dst.getX() - src.getX();
+        final double dz = dst.getZ() - src.getZ();
+        final double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
+        if (horizontalDistance <= 1.0D) {
+            return this.defaultTerrainReferenceY();
+        }
+        final double windowDistance = Math.max(24.0D, spacing * 1.5D);
+        final double centerDistance = Mth.clamp(horizontalDistance * centerT, 0.0D, horizontalDistance);
+        final double startDistance = Math.max(0.0D, centerDistance - windowDistance * 0.5D);
+        final double endDistance = Math.min(horizontalDistance, centerDistance + windowDistance * 0.5D);
+        final int samples = Math.max(1, fastCeil((endDistance - startDistance) / 8.0D));
+        int maxTerrainY = Integer.MIN_VALUE;
+        boolean foundLoadedTerrain = false;
+        boolean unknownTerrain = false;
+        for (int i = 0; i <= samples; i++) {
+            final double travelled = Mth.lerp(i / (double) samples, startDistance, endDistance);
+            final double t = travelled / horizontalDistance;
+            final int x = fastFloor(src.getX() + dx * t);
+            final int z = fastFloor(src.getZ() + dz * t);
+            Integer terrainTopY = this.getTerrainTopYIfLoaded(x, z);
+            if (terrainTopY == null) {
+                unknownTerrain = true;
+                continue;
+            }
+            foundLoadedTerrain = true;
+            maxTerrainY = Math.max(maxTerrainY, terrainTopY);
+        }
+        if (!foundLoadedTerrain) {
+            return this.defaultTerrainReferenceY();
+        }
+        if (unknownTerrain) {
+            maxTerrainY += Math.max(4, Baritone.settings().elytraOverworldTerrainClearance.value / 2);
+        }
+        return maxTerrainY;
+    }
+
+    private int defaultTerrainReferenceY() {
+        final int minY = ctx.world().dimensionType().minY();
+        final int maxY = minY + ctx.world().dimensionType().height() - 1;
+        return Mth.clamp(ctx.world().getSeaLevel() + 1, minY + 1, maxY);
+    }
+
+    private Integer getTerrainTopYIfLoaded(final int x, final int z) {
+        if (!this.bsi.isLoaded(x, z)) {
+            return null;
+        }
+        return ctx.world().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
     }
 
     public void onRenderPass(RenderEvent event) {
@@ -457,7 +658,9 @@ public final class ElytraBehavior implements Helper {
     }
 
     public void onBlockChange(BlockChangeEvent event) {
-        this.context.queueBlockUpdate(event);
+        if (this.context != null) {
+            this.context.queueBlockUpdate(event);
+        }
     }
 
     public void onReceivePacket(PacketEvent event) {
@@ -469,9 +672,14 @@ public final class ElytraBehavior implements Helper {
     }
 
     public void pathTo() {
-        if (!Baritone.settings().elytraAutoJump.value || ctx.player().isFallFlying()) {
+        debug("behavior pathTo autoJump=" + Baritone.settings().elytraAutoJump.value + " isFallFlying=" + ctx.player().isFallFlying());
+        if (!this.shouldAutoTakeoff() || ctx.player().isFallFlying()) {
             this.pathManager.pathToDestination();
         }
+    }
+
+    private boolean shouldAutoTakeoff() {
+        return this.ctx.world().dimension() != Level.NETHER || Baritone.settings().elytraAutoJump.value;
     }
 
     public void destroy() {
@@ -484,10 +692,15 @@ public final class ElytraBehavior implements Helper {
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
-        this.context.destroy();
+        if (this.context != null) {
+            this.context.destroy();
+        }
     }
 
     public void repackChunks() {
+        if (this.context == null) {
+            return;
+        }
         ChunkSource chunkProvider = ctx.world().getChunkSource();
 
         BetterBlockPos playerPos = ctx.playerFeet();
@@ -512,130 +725,462 @@ public final class ElytraBehavior implements Helper {
     }
 
     public void onTick() {
-        synchronized (this.context.cullingLock) {
+        if (this.context != null) {
+            synchronized (this.context.cullingLock) {
+                this.onTick0();
+            }
+        } else {
             this.onTick0();
         }
         final long now = System.currentTimeMillis();
-        if ((now - this.timeLastCacheCull) / 1000 > Baritone.settings().elytraTimeBetweenCacheCullSecs.value) {
+        if (this.context != null && (now - this.timeLastCacheCull) / 1000 > Baritone.settings().elytraTimeBetweenCacheCullSecs.value) {
             this.context.queueCacheCulling(ctx.player().chunkPosition().x(), ctx.player().chunkPosition().z(), Baritone.settings().elytraCacheCullDistance.value, this.boi);
             this.timeLastCacheCull = now;
         }
     }
 
     private void onTick0() {
-        // Fetch the previous solution, regardless of if it's going to be used
-        this.pendingSolution = null;
-        if (this.solver != null) {
-            try {
-                this.pendingSolution = this.solver.get();
-            } catch (Exception ignored) {
-                // it doesn't matter if get() fails since the solution can just be recalculated synchronously
-            } finally {
-                this.solver = null;
+        try {
+            debug("onTick0 start pathSize=" + this.pathManager.getPath().size() + " state=" + this.process.state);
+            this.pendingSolution = null;
+            if (this.solver != null) {
+                if (this.solver.isDone()) {
+                    try {
+                        this.pendingSolution = this.solver.get();
+                        if (this.pendingSolution != null) {
+                            this.lastSolution = this.pendingSolution;
+                        }
+                    } catch (Exception ignored) {
+                        // ignore solver failures; a later async solve can replace the cached solution
+                    } finally {
+                        this.solver = null;
+                    }
+                } else if (this.landingMode) {
+                    this.pendingSolution = this.lastSolution;
+                }
             }
-        }
 
-        tickInventoryTransactions();
+            tickInventoryTransactions();
 
-        // Certified mojang employee incident
-        if (this.remainingFireworkTicks > 0) {
-            this.remainingFireworkTicks--;
-        }
-        if (this.remainingSetBackTicks > 0) {
-            this.remainingSetBackTicks--;
-        }
-        if (!this.getAttachedFirework().isPresent()) {
-            this.minimumBoostTicks = 0;
-        }
+            // Certified mojang employee incident
+            if (this.remainingFireworkTicks > 0) {
+                this.remainingFireworkTicks--;
+            }
+            if (this.remainingSetBackTicks > 0) {
+                this.remainingSetBackTicks--;
+            }
+            if (!this.getAttachedFirework().isPresent()) {
+                this.minimumBoostTicks = 0;
+            }
 
-        // Reset rendered elements
-        this.clearLines.clear();
-        this.blockedLines.clear();
-        this.visiblePath = null;
-        this.simulationLine = null;
-        this.aimPos = null;
+            // Reset rendered elements
+            this.clearLines.clear();
+            this.blockedLines.clear();
+            this.visiblePath = null;
+            this.simulationLine = null;
+            this.aimPos = null;
 
-        final List<BetterBlockPos> path = this.pathManager.getPath();
-        if (path.isEmpty()) {
-            return;
-        } else if (this.destination == null) {
+            final List<BetterBlockPos> path = this.pathManager.getPath();
+            if (path.isEmpty()) {
+                debug("onTick0 abort empty path");
+                return;
+            } else if (this.destination == null) {
+                debug("onTick0 abort null destination");
+                this.pathManager.clear();
+                return;
+            }
+
+            // ctx AND context???? :DDD
+            this.bsi = new BlockStateInterface(ctx);
+            debug("onTick0 bsi refreshed");
+            if (this.useNetherPathfinder) {
+                debug("onTick0 pathManager.tick begin");
+                this.pathManager.tick();
+                debug("onTick0 pathManager.tick complete");
+            } else {
+                debug("onTick0 overworld updatePlayerNear begin");
+                this.pathManager.updatePlayerNear();
+                debug("onTick0 overworld updatePlayerNear complete");
+            }
+
+            final int playerNear = this.pathManager.getNear();
+            this.visiblePath = path.subList(
+                    Math.max(playerNear - 30, 0),
+                    Math.min(playerNear + 100, path.size())
+            );
+            debug("onTick0 complete playerNear=" + playerNear + " visiblePath=" + this.visiblePath.size());
+        } catch (Throwable t) {
+            debug("onTick0 threw " + t.getClass().getName() + ": " + t.getMessage());
+            t.printStackTrace();
             this.pathManager.clear();
-            return;
         }
-
-        // ctx AND context???? :DDD
-        this.bsi = new BlockStateInterface(ctx);
-        this.pathManager.tick();
-
-        final int playerNear = this.pathManager.getNear();
-        this.visiblePath = path.subList(
-                Math.max(playerNear - 30, 0),
-                Math.min(playerNear + 100, path.size())
-        );
     }
 
     /**
      * Called by {@link baritone.process.ElytraProcess#onTick(boolean, boolean)} when the process is in control and the player is flying
      */
     public void tick() {
-        if (this.pathManager.getPath().isEmpty()) {
-            return;
+        try {
+            debug("tick start pathSize=" + this.pathManager.getPath().size() + " fallFlying=" + ctx.player().isFallFlying());
+            if (this.pathManager.getPath().isEmpty()) {
+                debug("tick abort empty path");
+                return;
+            }
+
+            trySwapElytra();
+
+            if (ctx.player().horizontalCollision) {
+                logVerbose("hbonk");
+            }
+            if (ctx.player().verticalCollision) {
+                logVerbose("vbonk");
+            }
+
+            final SolverContext solverContext = this.new SolverContext(false);
+            this.solveNextTick = true;
+
+            final Solution solution;
+            final Solution reusable = this.canReuseSolution(this.pendingSolution, solverContext)
+                    ? this.pendingSolution
+                    : this.canReuseSolution(this.lastSolution, solverContext)
+                    ? this.lastSolution
+                    : null;
+            if (reusable != null) {
+                if (reusable == this.pendingSolution) {
+                    debug("tick using pending solution");
+                } else {
+                    debug("tick using cached solution");
+                }
+                solution = reusable;
+            } else if (this.landingMode) {
+                debug("tick awaiting async landing solution");
+                return;
+            } else {
+                debug("tick solving sync");
+                solution = this.solveAngles(solverContext);
+                if (solution != null) {
+                    this.lastSolution = solution;
+                }
+            }
+
+            if (this.deployedFireworkLastTick) {
+                this.nextTickBoostCounter[solverContext.boost.isBoosted() ? 1 : 0]++;
+                this.deployedFireworkLastTick = false;
+            }
+
+            final boolean inLava = ctx.player().isInLava();
+            if (inLava) {
+                baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
+            }
+
+            if (solution == null) {
+                logVerbose("no solution");
+                debug("tick abort null solution");
+                return;
+            }
+
+            baritone.getLookBehavior().updateTarget(solution.rotation, false);
+            debug("tick solution goingTo=" + solution.goingTo + " solvedPitch=" + solution.solvedPitch + " forceFw=" + solution.forceUseFirework);
+
+            if (!solution.solvedPitch) {
+                logVerbose("no pitch solution, probably gonna crash in a few ticks LOL!!!");
+                return;
+            } else {
+                this.aimPos = new BetterBlockPos(solution.goingTo.x, solution.goingTo.y, solution.goingTo.z);
+            }
+
+            this.tickUseFireworks(
+                    solution.context.start,
+                    solution.goingTo,
+                    solution.context.boost.isBoosted(),
+                    solution.forceUseFirework || inLava
+            );
+        } catch (Throwable t) {
+            debug("tick threw " + t.getClass().getName() + ": " + t.getMessage());
+            t.printStackTrace();
+            this.pathManager.clear();
         }
+    }
 
-        trySwapElytra();
-
-        if (ctx.player().horizontalCollision) {
-            logVerbose("hbonk");
+    private int selectOverworldTargetIndex(final NetherPath path, final int playerNear, final boolean landing) {
+        if (path.isEmpty()) {
+            return 0;
         }
-        if (ctx.player().verticalCollision) {
-            logVerbose("vbonk");
+        final int finalIndex = path.size() - 1;
+        if (landing) {
+            final int approachIndex = Math.max(0, finalIndex - 1);
+            final Vec3 landingTarget = this.getOverworldLandingControlPoint(path);
+            final double horizontalDistance = this.horizontalDistanceSq(ctx.player().position(), landingTarget);
+            final double verticalOffset = ctx.player().position().y - landingTarget.y;
+            if (horizontalDistance < 6 * 6 || verticalOffset < 6.0D) {
+                return finalIndex;
+            }
+            return approachIndex;
         }
+        final Vec3 finalTarget = this.getOverworldTarget(path, finalIndex);
+        final double finalDistanceSq = this.horizontalDistanceSq(ctx.player().position(), finalTarget);
+        if (path.size() >= 2 && finalDistanceSq < 48 * 48) {
+            return finalIndex;
+        }
+        final boolean finalApproach = this.appendDestination
+                || finalDistanceSq < Math.max(24 * 24, Baritone.settings().elytraOverworldWaypointDistance.value * Baritone.settings().elytraOverworldWaypointDistance.value)
+                || playerNear >= Math.max(0, this.getOverworldCruiseIndex(path) - 1);
+        final int maxIndex = finalApproach ? finalIndex : this.getOverworldCruiseIndex(path);
+        final int firstCandidate = Math.min(playerNear + 1, maxIndex);
+        int best = firstCandidate;
+        final Vec3 eye = ctx.playerHead();
+        final Vec3 feet = ctx.playerFeetAsVec();
+        for (int i = firstCandidate; i <= Math.min(maxIndex, firstCandidate + 4); i++) {
+            final Vec3 candidate = this.getOverworldTarget(path, i);
+            if (eye.distanceToSqr(candidate) < 16 * 16) {
+                best = i;
+                continue;
+            }
+            if (this.clearView(eye, candidate, false) || this.clearView(feet, candidate, false)) {
+                best = i;
+                continue;
+            }
+            break;
+        }
+        if (path.size() >= 2 && best >= maxIndex && finalApproach && (this.clearView(eye, finalTarget, false) || this.clearView(feet, finalTarget, false))) {
+            return finalIndex;
+        }
+        return best;
+    }
 
-        final SolverContext solverContext = this.new SolverContext(false);
-        this.solveNextTick = true;
+    private Vec3 getOverworldTarget(final NetherPath path, final int index) {
+        final BetterBlockPos pos = path.get(index);
+        return Vec3.atCenterOf(new BlockPos(pos.x, pos.y, pos.z));
+    }
 
-        // If there's no previously calculated solution to use, or the context used at the end of last tick doesn't match this tick
-        final Solution solution;
-        if (this.pendingSolution == null || !this.pendingSolution.context.equals(solverContext)) {
-            solution = this.solveAngles(solverContext);
+    private Vec3 getOverworldLandingControlPoint(final NetherPath path) {
+        if (this.landingTarget != null) {
+            final double controlY = this.waterLandingTarget ? this.landingTarget.y + 8.0D : this.landingTarget.y + 3.0D;
+            return new Vec3(this.landingTarget.x + 0.5D, controlY, this.landingTarget.z + 0.5D);
+        }
+        return this.getOverworldTarget(path, path.size() - 1);
+    }
+
+    private Vec3 getLandingPadCenter() {
+        if (this.landingTarget == null) {
+            return null;
+        }
+        final double landingY = this.waterLandingTarget ? this.landingTarget.y + 0.5D : this.landingTarget.y + 1.0D;
+        return new Vec3(this.landingTarget.x + 0.5D, landingY, this.landingTarget.z + 0.5D);
+    }
+
+    private LandingProfile buildLandingProfile(final SolverContext context) {
+        final Vec3 landingCenter = this.getLandingPadCenter();
+        if (landingCenter == null) {
+            return null;
+        }
+        final Vec3 toPad = new Vec3(landingCenter.x - context.start.x, 0.0D, landingCenter.z - context.start.z);
+        Vec3 runwayDir = context.motion.multiply(1.0D, 0.0D, 1.0D);
+        if (runwayDir.lengthSqr() < 0.25D * 0.25D) {
+            runwayDir = toPad;
+        }
+        if (runwayDir.lengthSqr() < 1.0E-6D) {
+            runwayDir = new Vec3(1.0D, 0.0D, 0.0D);
         } else {
-            solution = this.pendingSolution;
+            runwayDir = runwayDir.normalize();
+        }
+        final double horizontalSpeed = context.motion.multiply(1.0D, 0.0D, 1.0D).length();
+        final double downwardSpeed = Math.max(0.0D, -context.motion.y);
+        final double altitudeAbovePad = Math.max(0.0D, context.start.y - landingCenter.y);
+        final double currentDistance = Math.sqrt(this.horizontalDistanceSq(context.start, landingCenter));
+        final double prepDistance = Mth.clamp(horizontalSpeed * 26.0D + downwardSpeed * 18.0D + Math.max(0.0D, altitudeAbovePad - 6.0D) * 0.35D + 18.0D, 28.0D, 96.0D);
+        final double approachDistance = Mth.clamp(horizontalSpeed * 16.0D + downwardSpeed * 12.0D + altitudeAbovePad * 0.15D + 12.0D, 16.0D, 52.0D);
+        final double commitDistance = Mth.clamp(horizontalSpeed * 7.0D + downwardSpeed * 6.0D + 4.0D, 4.0D, 18.0D);
+        final double flareHeight = Mth.clamp(3.5D + horizontalSpeed * 2.5D + downwardSpeed * 8.0D, 4.0D, 12.0D);
+        final double approachHeight = Mth.clamp(flareHeight + 6.0D + horizontalSpeed * 3.0D + downwardSpeed * 8.0D, flareHeight + 4.0D, 26.0D);
+        return new LandingProfile(landingCenter, runwayDir, horizontalSpeed, downwardSpeed, altitudeAbovePad, currentDistance, prepDistance, approachDistance, commitDistance, approachHeight, flareHeight);
+    }
+
+    private Vec3 buildLandingControlTarget(final LandingProfile profile, final double shortDistance, final double height) {
+        return profile.landingCenter.subtract(profile.runwayDir.scale(shortDistance)).add(0.0D, height, 0.0D);
+    }
+
+    private List<LandingCandidate> buildLandingApproachCandidates(final LandingProfile profile) {
+        final List<LandingCandidate> candidates = new ArrayList<>(3);
+        final double extendDistance = Math.min(profile.prepDistance, profile.approachDistance + 12.0D);
+        candidates.add(new LandingCandidate(this.buildLandingControlTarget(profile, extendDistance, Math.min(26.0D, profile.approachHeight + 5.0D)), extendDistance, Math.min(26.0D, profile.approachHeight + 5.0D)));
+        candidates.add(new LandingCandidate(this.buildLandingControlTarget(profile, profile.approachDistance, profile.approachHeight), profile.approachDistance, profile.approachHeight));
+        final double transitionDistance = Math.max(profile.commitDistance + 6.0D, profile.approachDistance - 8.0D);
+        final double transitionHeight = Math.max(profile.flareHeight + 4.0D, profile.approachHeight - 5.0D);
+        candidates.add(new LandingCandidate(this.buildLandingControlTarget(profile, transitionDistance, transitionHeight), transitionDistance, transitionHeight));
+        return candidates;
+    }
+
+    private List<LandingCandidate> buildLandingTouchdownCandidates(final LandingProfile profile) {
+        final List<LandingCandidate> candidates = new ArrayList<>(3);
+        final double highShortDistance = Math.max(profile.commitDistance + 4.0D, 6.0D);
+        candidates.add(new LandingCandidate(this.buildLandingControlTarget(profile, highShortDistance, profile.flareHeight + 3.0D), highShortDistance, profile.flareHeight + 3.0D));
+        candidates.add(new LandingCandidate(this.buildLandingControlTarget(profile, profile.commitDistance, profile.flareHeight), profile.commitDistance, profile.flareHeight));
+        final double finalShortDistance = Math.max(2.5D, profile.commitDistance * 0.5D);
+        candidates.add(new LandingCandidate(this.buildLandingControlTarget(profile, finalShortDistance, Math.max(2.5D, profile.flareHeight - 1.0D)), finalShortDistance, Math.max(2.5D, profile.flareHeight - 1.0D)));
+        return candidates;
+    }
+
+    private Vec3 getOverworldControlTarget(final NetherPath path, final int targetIndex, final boolean landing) {
+        if (landing && targetIndex == path.size() - 1) {
+            return this.getOverworldLandingControlPoint(path);
+        }
+        if (!landing) {
+            return this.getOverworldCruiseControlPoint(path, targetIndex);
+        }
+        return this.getOverworldTarget(path, targetIndex);
+    }
+
+    private Vec3 getOverworldCruiseControlPoint(final NetherPath path, final int targetIndex) {
+        if (targetIndex <= 0) {
+            return this.getOverworldTarget(path, targetIndex);
         }
 
-        if (this.deployedFireworkLastTick) {
-            this.nextTickBoostCounter[solverContext.boost.isBoosted() ? 1 : 0]++;
-            this.deployedFireworkLastTick = false;
+        final Vec3 start = this.getOverworldTarget(path, targetIndex - 1);
+        final Vec3 end = this.getOverworldTarget(path, targetIndex);
+        final Vec3 delta = end.subtract(start);
+        final double length = delta.length();
+        if (length < 1.0E-3D) {
+            return end;
         }
 
-        final boolean inLava = ctx.player().isInLava();
-        if (inLava) {
-            baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
-        }
+        final Vec3 direction = delta.scale(1.0D / length);
+        final double leadDistance = Math.min(length, Math.max(8.0D, Baritone.settings().elytraOverworldWaypointDistance.value * 0.5D));
+        final double projection = Mth.clamp(ctx.player().position().subtract(start).dot(direction), 0.0D, length);
+        return start.add(direction.scale(Math.min(length, projection + leadDistance)));
+    }
 
+    private int getOverworldCruiseIndex(final NetherPath path) {
+        if (path.size() <= 1) {
+            return 0;
+        }
+        return path.size() - 2;
+    }
+
+    private boolean canReuseSolution(final Solution solution, final SolverContext context) {
         if (solution == null) {
-            logVerbose("no solution");
-            return;
+            return false;
+        }
+        final SolverContext prior = solution.context;
+        if (prior.path != context.path || prior.landingMode != context.landingMode) {
+            return false;
+        }
+        if (Math.abs(prior.playerNear - context.playerNear) > 1) {
+            return false;
+        }
+        if (prior.start.distanceToSqr(context.start) > (context.landingMode ? 64.0D : 16.0D)) {
+            return false;
+        }
+        if (prior.motion.subtract(context.motion).lengthSqr() > (context.landingMode ? 0.20D : 0.08D)) {
+            return false;
+        }
+        if (!context.landingMode) {
+            return prior.boost.equals(context.boost) && prior.ignoreLava == context.ignoreLava;
+        }
+        return true;
+    }
+
+    private double computeOverworldDesiredAltitude(final NetherPath path, final int targetIndex, final Vec3 target, final boolean landing) {
+        final int finalIndex = path.size() - 1;
+        if (landing) {
+            final Vec3 landingTarget = this.getOverworldLandingControlPoint(path);
+            final double horizontalDistance = Math.sqrt(this.horizontalDistanceSq(ctx.player().position(), landingTarget));
+            final double glideAltitude = landingTarget.y + Math.min(40.0D, horizontalDistance * 0.35D + 6.0D);
+            if (targetIndex == finalIndex) {
+                return Math.max(landingTarget.y + 1.5D, glideAltitude);
+            }
+            return Math.max(target.y, glideAltitude + 8.0D);
+        }
+        final double terrainSafeAltitude = this.sampleTerrainAhead(target);
+        final double horizontalSpeed = ctx.player().getDeltaMovement().multiply(1.0D, 0.0D, 1.0D).length();
+        final double downwardSpeed = Math.max(0.0D, -ctx.player().getDeltaMovement().y);
+        final double climbBuffer = Mth.clamp(2.0D + horizontalSpeed * 1.5D + downwardSpeed * 10.0D, 2.0D, 8.0D);
+        return Math.max(target.y, terrainSafeAltitude + climbBuffer);
+    }
+
+    private double sampleTerrainAhead(final Vec3 target) {
+        final Vec3 start = ctx.playerFeetAsVec();
+        final double dx = target.x - start.x;
+        final double dz = target.z - start.z;
+        final double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
+        if (horizontalDistance <= 1.0D) {
+            return ctx.player().position().y;
         }
 
-        baritone.getLookBehavior().updateTarget(solution.rotation, false);
-
-        if (!solution.solvedPitch) {
-            logVerbose("no pitch solution, probably gonna crash in a few ticks LOL!!!");
-            return;
-        } else {
-            this.aimPos = new BetterBlockPos(solution.goingTo.x, solution.goingTo.y, solution.goingTo.z);
+        final double horizontalSpeed = ctx.player().getDeltaMovement().multiply(1.0D, 0.0D, 1.0D).length();
+        final double requestedLookahead = Math.max(24.0D, Baritone.settings().elytraOverworldTerrainLookahead.value);
+        final double speedLookahead = 24.0D + horizontalSpeed * 22.0D;
+        final double lookahead = Mth.clamp(Math.max(horizontalDistance, Math.max(requestedLookahead, speedLookahead)), 24.0D, 128.0D);
+        final double dirX = dx / horizontalDistance;
+        final double dirZ = dz / horizontalDistance;
+        final int clearance = Baritone.settings().elytraOverworldTerrainClearance.value;
+        final int steps = Math.max(1, fastCeil(lookahead / 8.0D));
+        int maxTerrainY = Integer.MIN_VALUE;
+        boolean foundLoadedTerrain = false;
+        boolean unknownTerrain = false;
+        for (int i = 1; i <= steps; i++) {
+            final double distance = lookahead * (i / (double) steps);
+            final int x = fastFloor(start.x + dirX * distance);
+            final int z = fastFloor(start.z + dirZ * distance);
+            Integer terrainTopY = this.getTerrainTopYIfLoaded(x, z);
+            if (terrainTopY == null) {
+                unknownTerrain = true;
+                continue;
+            }
+            foundLoadedTerrain = true;
+            maxTerrainY = Math.max(maxTerrainY, terrainTopY);
         }
+        if (!foundLoadedTerrain) {
+            return ctx.player().position().y;
+        }
+        if (unknownTerrain) {
+            maxTerrainY += Math.max(4, clearance / 2);
+        }
+        return maxTerrainY + clearance;
+    }
 
-        this.tickUseFireworks(
-                solution.context.start,
-                solution.goingTo,
-                solution.context.boost.isBoosted(),
-                solution.forceUseFirework || inLava
-        );
+    private float computeOverworldPitch(final float basePitch, final double desiredAltitude, final boolean landing) {
+        final double altitudeError = desiredAltitude - ctx.player().position().y;
+        final double verticalVelocity = ctx.player().getDeltaMovement().y;
+        if (landing) {
+            final float correction = (float) Mth.clamp(altitudeError * 0.34D - verticalVelocity * 14.0D, -24.0D, 20.0D);
+            return Mth.clamp(basePitch - correction, -28.0F, 22.0F);
+        }
+        final float correction = (float) Mth.clamp(altitudeError * 0.40D - verticalVelocity * 14.0D, -24.0D, 24.0D);
+        return Mth.clamp(basePitch - correction, -45.0F, 35.0F);
+    }
+
+    private boolean shouldForceOverworldFirework(final double desiredAltitude, final Vec3 target, final boolean isBoosted, final boolean landing) {
+        if (landing) {
+            return false;
+        }
+        if (isBoosted) {
+            return false;
+        }
+        final double altitudeError = desiredAltitude - ctx.player().position().y;
+        final double terrainClearance = ctx.player().position().y - (this.sampleTerrainAhead(target) - Baritone.settings().elytraOverworldTerrainClearance.value);
+        final double verticalVelocity = ctx.player().getDeltaMovement().y;
+        final double horizontalSpeed = ctx.player().getDeltaMovement().multiply(1, 0, 1).length();
+        final double fireworkSpeed = Baritone.settings().elytraFireworkSpeed.value;
+        final boolean severeTerrainRisk = terrainClearance < Math.max(4, Baritone.settings().elytraOverworldTerrainClearance.value / 3) && verticalVelocity < -0.20D;
+        final boolean badlyBelowCruise = altitudeError > 18.0D && verticalVelocity < -0.25D && horizontalSpeed < fireworkSpeed * 1.15D;
+        if (!Baritone.settings().elytraConserveFireworks.value) {
+            return severeTerrainRisk || badlyBelowCruise;
+        }
+        return severeTerrainRisk;
+    }
+
+    private double horizontalDistanceSq(final Vec3 first, final Vec3 second) {
+        final double dx = first.x - second.x;
+        final double dz = first.z - second.z;
+        return dx * dx + dz * dz;
     }
 
     public void onPostTick(TickEvent event) {
         if (event.getType() == TickEvent.Type.IN && this.solveNextTick) {
+            if (this.solver != null && !this.solver.isDone()) {
+                return;
+            }
             // We're at the end of the tick, the player's position likely updated and the closest path node could've
             // changed. Updating it now will avoid unnecessary recalculation on the main thread.
             this.pathManager.updatePlayerNear();
@@ -647,8 +1192,128 @@ public final class ElytraBehavior implements Helper {
     }
 
     private Solution solveAngles(final SolverContext context) {
+        if (!this.useNetherPathfinder) {
+            return this.solveOverworldAngles(context);
+        }
+        return this.solveNetherAngles(context);
+    }
+
+    private Solution solveOverworldAngles(final SolverContext context) {
         final NetherPath path = context.path;
-        final int playerNear = landingMode ? path.size() - 1 : context.playerNear;
+        if (path.isEmpty()) {
+            return null;
+        }
+
+        if (context.landingMode && this.landingTarget != null) {
+            return this.solveOverworldLandingAngles(context, path);
+        }
+
+        final int targetIndex = this.selectOverworldTargetIndex(path, context.playerNear, context.landingMode);
+        final Vec3 target = this.getOverworldControlTarget(path, targetIndex, context.landingMode);
+        final double desiredAltitude = this.computeOverworldDesiredAltitude(path, targetIndex, target, context.landingMode);
+        final Vec3 controlTarget = new Vec3(target.x, desiredAltitude, target.z);
+        final Rotation rawRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), controlTarget, ctx.playerRotations());
+        final PitchSolveResult solvedPitch = this.solvePitch(context, controlTarget, 1);
+        final float pitch = solvedPitch != null
+                ? solvedPitch.result.pitch
+                : this.computeOverworldPitch(rawRotation.getPitch(), desiredAltitude, context.landingMode);
+        final boolean forceUseFirework = (solvedPitch != null && solvedPitch.forceUseFirework)
+                || this.shouldForceOverworldFirework(desiredAltitude, controlTarget, context.boost.isBoosted(), context.landingMode);
+        return new Solution(context, new Rotation(rawRotation.getYaw(), pitch), controlTarget, true, forceUseFirework);
+    }
+
+    private Solution solveOverworldLandingAngles(final SolverContext context, final NetherPath path) {
+        if (this.waterLandingTarget) {
+            return this.solveOverworldWaterLandingAngles(context);
+        }
+        final LandingProfile profile = this.buildLandingProfile(context);
+        if (profile == null) {
+            return null;
+        }
+
+        LandingOption bestTouchdown = null;
+        for (LandingCandidate candidate : this.buildLandingTouchdownCandidates(profile)) {
+            final Rotation rawRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), candidate.target, ctx.playerRotations());
+            final PitchSolveResult solvedPitch = this.solvePitch(context, candidate.target, 1, true);
+            if (solvedPitch == null || solvedPitch.result.landing == null) {
+                continue;
+            }
+            final LandingPrediction prediction = solvedPitch.result.landing;
+            if (!prediction.safeTouchdown) {
+                continue;
+            }
+            final LandingOption option = new LandingOption(candidate, solvedPitch, rawRotation.getYaw());
+            if (bestTouchdown == null || prediction.score < bestTouchdown.solve.result.landing.score) {
+                bestTouchdown = option;
+            }
+        }
+        if (bestTouchdown != null) {
+            return new Solution(context, new Rotation(bestTouchdown.yaw, bestTouchdown.solve.result.pitch), bestTouchdown.candidate.target, true, false);
+        }
+
+        Solution fallback = null;
+        for (LandingCandidate candidate : this.buildLandingApproachCandidates(profile)) {
+            final Rotation rawRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), candidate.target, ctx.playerRotations());
+            final PitchSolveResult solvedPitch = this.solvePitch(context, candidate.target, 1, false);
+            if (solvedPitch != null) {
+                return new Solution(context, new Rotation(rawRotation.getYaw(), solvedPitch.result.pitch), candidate.target, true, false);
+            }
+            if (fallback == null) {
+                fallback = new Solution(context, new Rotation(rawRotation.getYaw(), rawRotation.getPitch()), candidate.target, false, false);
+            }
+        }
+        if (fallback != null) {
+            return fallback;
+        }
+        final Vec3 fallbackTarget = this.buildLandingControlTarget(profile, profile.approachDistance, profile.approachHeight);
+        final Rotation rawRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), fallbackTarget, ctx.playerRotations());
+        return new Solution(context, new Rotation(rawRotation.getYaw(), rawRotation.getPitch()), fallbackTarget, false, false);
+    }
+
+    private Solution solveOverworldWaterLandingAngles(final SolverContext context) {
+        final Vec3 landingCenter = this.getLandingPadCenter();
+        if (landingCenter == null) {
+            return null;
+        }
+        final Vec3 horizontalMotion = context.motion.multiply(1.0D, 0.0D, 1.0D);
+        Vec3 runwayDir = horizontalMotion;
+        if (runwayDir.lengthSqr() < 1.0E-6D) {
+            runwayDir = new Vec3(landingCenter.x - context.start.x, 0.0D, landingCenter.z - context.start.z);
+        }
+        if (runwayDir.lengthSqr() < 1.0E-6D) {
+            runwayDir = new Vec3(1.0D, 0.0D, 0.0D);
+        } else {
+            runwayDir = runwayDir.normalize();
+        }
+
+        final double horizontalDistance = Math.sqrt(this.horizontalDistanceSq(context.start, landingCenter));
+        final double altitudeAbovePad = Math.max(0.0D, context.start.y - landingCenter.y);
+        final double horizontalSpeed = horizontalMotion.length();
+        final double downwardSpeed = Math.max(0.0D, -context.motion.y);
+
+        final Vec3 target;
+        final float pitch;
+        if (horizontalDistance > 6.0D) {
+            final double setupDistance = Mth.clamp(horizontalSpeed * 8.0D + altitudeAbovePad * 0.08D + 6.0D, 6.0D, 20.0D);
+            final double setupHeight = Mth.clamp(8.0D + horizontalSpeed * 5.0D + downwardSpeed * 6.0D, 8.0D, 28.0D);
+            target = landingCenter.subtract(runwayDir.scale(Math.min(setupDistance, Math.max(2.0D, horizontalDistance - 2.0D))))
+                    .add(0.0D, Math.min(setupHeight, altitudeAbovePad + 4.0D), 0.0D);
+            final Rotation rawRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), target, ctx.playerRotations());
+            final PitchSolveResult solvedPitch = this.solvePitch(context, target, 1, false);
+            pitch = solvedPitch != null ? solvedPitch.result.pitch : rawRotation.getPitch();
+        } else {
+            target = landingCenter.add(0.0D, -4.0D, 0.0D);
+            final Rotation rawRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), target, ctx.playerRotations());
+            pitch = Mth.clamp(Math.max(rawRotation.getPitch(), 65.0F), 60.0F, 85.0F);
+        }
+
+        final Rotation finalRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), target, ctx.playerRotations()).withPitch(pitch);
+        return new Solution(context, finalRotation, target, true, false);
+    }
+
+    private Solution solveNetherAngles(final SolverContext context) {
+        final NetherPath path = context.path;
+        final int playerNear = context.landingMode ? path.size() - 1 : context.playerNear;
         final Vec3 start = context.start;
         Solution solution = null;
 
@@ -688,7 +1353,7 @@ public final class ElytraBehavior implements Helper {
                 for (final Pair<Vec3, Integer> candidate : candidates) {
                     final Integer augment = candidate.second();
                     Vec3 dest = candidate.first().add(0, augment, 0);
-                    if (landingMode) {
+                    if (context.landingMode) {
                         dest = dest.add(0.5, 0.5, 0.5);
                     }
 
@@ -718,14 +1383,14 @@ public final class ElytraBehavior implements Helper {
                         // Yaw is trivial, just calculate the rotation required to face the destination
                         final float yaw = RotationUtils.calcRotationFromVec3d(start, dest, ctx.playerRotations()).getYaw();
 
-                        final Pair<Float, Boolean> pitch = this.solvePitch(context, dest, relaxation);
+                        final PitchSolveResult pitch = this.solvePitch(context, dest, relaxation);
                         if (pitch == null) {
                             solution = new Solution(context, new Rotation(yaw, ctx.playerRotations().getPitch()), null, false, false);
                             continue;
                         }
 
                         // A solution was found with yaw AND pitch, so just immediately return it.
-                        return new Solution(context, new Rotation(yaw, pitch.first()), dest, true, pitch.second());
+                        return new Solution(context, new Rotation(yaw, pitch.result.pitch), dest, true, pitch.forceUseFirework);
                     }
                 }
             }
@@ -780,6 +1445,7 @@ public final class ElytraBehavior implements Helper {
         public final boolean ignoreLava;
         public final FireworkBoost boost;
         public final IAimProcessor aimProcessor;
+        public final boolean landingMode;
 
         /**
          * Creates a new SolverContext using the current state of the path, player, and firework boost at the time of
@@ -795,6 +1461,7 @@ public final class ElytraBehavior implements Helper {
             this.motion = ctx.playerMotion();
             this.boundingBox = ctx.player().getBoundingBox();
             this.ignoreLava = ctx.player().isInLava();
+            this.landingMode = ElytraBehavior.this.landingMode;
 
             final Integer fireworkTicksExisted;
             if (async && ElytraBehavior.this.deployedFireworkLastTick) {
@@ -829,6 +1496,7 @@ public final class ElytraBehavior implements Helper {
                     && Objects.equals(this.motion, other.motion)
                     && Objects.equals(this.boundingBox, other.boundingBox)
                     && this.ignoreLava == other.ignoreLava
+                    && this.landingMode == other.landingMode
                     && Objects.equals(this.boost, other.boost);
         }
     }
@@ -895,11 +1563,117 @@ public final class ElytraBehavior implements Helper {
         public final float pitch;
         public final double dot;
         public final List<Vec3> steps;
+        public final LandingPrediction landing;
 
-        public PitchResult(float pitch, double dot, List<Vec3> steps) {
+        public PitchResult(float pitch, double dot, List<Vec3> steps, LandingPrediction landing) {
             this.pitch = pitch;
             this.dot = dot;
             this.steps = steps;
+            this.landing = landing;
+        }
+    }
+
+    private static final class PitchSolveResult {
+
+        public final PitchResult result;
+        public final boolean forceUseFirework;
+
+        public PitchSolveResult(PitchResult result, boolean forceUseFirework) {
+            this.result = result;
+            this.forceUseFirework = forceUseFirework;
+        }
+    }
+
+    private static final class LandingProfile {
+
+        public final Vec3 landingCenter;
+        public final Vec3 runwayDir;
+        public final double horizontalSpeed;
+        public final double downwardSpeed;
+        public final double altitudeAbovePad;
+        public final double currentDistance;
+        public final double prepDistance;
+        public final double approachDistance;
+        public final double commitDistance;
+        public final double approachHeight;
+        public final double flareHeight;
+
+        public LandingProfile(Vec3 landingCenter, Vec3 runwayDir, double horizontalSpeed, double downwardSpeed, double altitudeAbovePad, double currentDistance, double prepDistance, double approachDistance, double commitDistance, double approachHeight, double flareHeight) {
+            this.landingCenter = landingCenter;
+            this.runwayDir = runwayDir;
+            this.horizontalSpeed = horizontalSpeed;
+            this.downwardSpeed = downwardSpeed;
+            this.altitudeAbovePad = altitudeAbovePad;
+            this.currentDistance = currentDistance;
+            this.prepDistance = prepDistance;
+            this.approachDistance = approachDistance;
+            this.commitDistance = commitDistance;
+            this.approachHeight = approachHeight;
+            this.flareHeight = flareHeight;
+        }
+    }
+
+    private static final class LandingCandidate {
+
+        public final Vec3 target;
+        public final double shortDistance;
+        public final double height;
+
+        public LandingCandidate(Vec3 target, double shortDistance, double height) {
+            this.target = target;
+            this.shortDistance = shortDistance;
+            this.height = height;
+        }
+    }
+
+    private static final class LandingOption {
+
+        public final LandingCandidate candidate;
+        public final PitchSolveResult solve;
+        public final float yaw;
+
+        public LandingOption(LandingCandidate candidate, PitchSolveResult solve, float yaw) {
+            this.candidate = candidate;
+            this.solve = solve;
+            this.yaw = yaw;
+        }
+    }
+
+    private static final class LandingPrediction {
+
+        public final Vec3 touchdown;
+        public final Vec3 impactMotion;
+        public final double alongError;
+        public final double crossError;
+        public final double projectedStopError;
+        public final double downwardSpeed;
+        public final double horizontalSpeed;
+        public final boolean safeTouchdown;
+        public final double score;
+
+        public LandingPrediction(Vec3 touchdown, Vec3 impactMotion, double alongError, double crossError, double projectedStopError, double downwardSpeed, double horizontalSpeed, boolean safeTouchdown, double score) {
+            this.touchdown = touchdown;
+            this.impactMotion = impactMotion;
+            this.alongError = alongError;
+            this.crossError = crossError;
+            this.projectedStopError = projectedStopError;
+            this.downwardSpeed = downwardSpeed;
+            this.horizontalSpeed = horizontalSpeed;
+            this.safeTouchdown = safeTouchdown;
+            this.score = score;
+        }
+    }
+
+    private static final class SimulationResult {
+
+        public final List<Vec3> steps;
+        public final Vec3 finalMotion;
+        public final LandingPrediction landing;
+
+        public SimulationResult(List<Vec3> steps, Vec3 finalMotion, LandingPrediction landing) {
+            this.steps = steps;
+            this.finalMotion = finalMotion;
+            this.landing = landing;
         }
     }
 
@@ -1000,16 +1774,27 @@ public final class ElytraBehavior implements Helper {
             return clear;
         }
 
-        return this.context.raytrace(8, src, dst, NetherPathfinderContext.Visibility.ALL);
+        if (this.context != null && !ignoreLava) {
+            return this.context.raytrace(8, src, dst, NetherPathfinderContext.Visibility.ALL);
+        }
+
+        for (int i = 0; i < 8; i++) {
+            final Vec3 s = new Vec3(src[i * 3], src[i * 3 + 1], src[i * 3 + 2]);
+            final Vec3 d = new Vec3(dst[i * 3], dst[i * 3 + 1], dst[i * 3 + 2]);
+            if (!this.clearView(s, d, ignoreLava)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public boolean clearView(Vec3 start, Vec3 dest, boolean ignoreLava) {
         final boolean clear;
-        if (!ignoreLava) {
+        if (!ignoreLava && this.context != null) {
             // if start == dest then the cpp raytracer dies
             clear = start.equals(dest) || this.context.raytrace(start, dest);
         } else {
-            clear = ctx.world().clip(new ClipContext(start, dest, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, ctx.player())).getType() == HitResult.Type.MISS;
+            clear = this.voxelRaytraceClear(start, dest, ignoreLava);
         }
 
         if (Baritone.settings().elytraRenderRaytraces.value) {
@@ -1033,6 +1818,22 @@ public final class ElytraBehavior implements Helper {
         return pitchValues;
     }
 
+    private static FloatArrayList pitchesToSolveForLanding(final float goodPitch) {
+        final float minPitch = Math.max(goodPitch - 10.0F, -80.0F);
+        final float maxPitch = Math.min(goodPitch + 10.0F, 50.0F);
+        final FloatArrayList pitchValues = new FloatArrayList(11);
+        pitchValues.add(goodPitch);
+        for (float delta = 2.0F; delta <= 10.0F; delta += 2.0F) {
+            if (goodPitch + delta <= maxPitch) {
+                pitchValues.add(goodPitch + delta);
+            }
+            if (goodPitch - delta >= minPitch) {
+                pitchValues.add(goodPitch - delta);
+            }
+        }
+        return pitchValues;
+    }
+
     @FunctionalInterface
     private interface IntTriFunction<T> {
         T apply(int first, int second, int third);
@@ -1050,13 +1851,19 @@ public final class ElytraBehavior implements Helper {
         }
     }
 
-    private Pair<Float, Boolean> solvePitch(final SolverContext context, final Vec3 goal, final int relaxation) {
+    private PitchSolveResult solvePitch(final SolverContext context, final Vec3 goal, final int relaxation) {
+        return this.solvePitch(context, goal, relaxation, context.landingMode);
+    }
+
+    private PitchSolveResult solvePitch(final SolverContext context, final Vec3 goal, final int relaxation, final boolean requireTouchdown) {
         final boolean desperate = relaxation == 2;
         final float goodPitch = RotationUtils.calcRotationFromVec3d(context.start, goal, ctx.playerRotations()).getPitch();
-        final FloatArrayList pitches = pitchesToSolveFor(goodPitch, desperate);
+        final FloatArrayList pitches = context.landingMode
+                ? pitchesToSolveForLanding(goodPitch)
+                : pitchesToSolveFor(goodPitch, desperate);
 
         final IntTriFunction<PitchResult> solve = (ticks, ticksBoosted, ticksBoostDelay) ->
-                this.solvePitch(context, goal, relaxation, pitches.iterator(), ticks, ticksBoosted, ticksBoostDelay);
+                this.solvePitch(context, goal, relaxation, pitches.iterator(), ticks, ticksBoosted, ticksBoostDelay, requireTouchdown);
 
         final List<IntTriple> tests = new ArrayList<>();
 
@@ -1076,7 +1883,12 @@ public final class ElytraBehavior implements Helper {
         }
 
         // Standard test, assume (not) boosted for entire duration
-        final int ticks = desperate ? 3 : context.boost.isBoosted() ? Math.max(5, context.boost.getGuaranteedBoostTicks()) : Baritone.settings().elytraSimulationTicks.value;
+        final double horizontalDistance = Math.sqrt(this.horizontalDistanceSq(context.start, goal));
+        final double horizontalSpeed = Math.max(0.35D, context.motion.multiply(1.0D, 0.0D, 1.0D).length());
+        final int landingTicks = Mth.clamp(fastCeil(horizontalDistance / horizontalSpeed) + (requireTouchdown ? 10 : 6), requireTouchdown ? 24 : 14, requireTouchdown ? 72 : 40);
+        final int ticks = context.landingMode
+                ? landingTicks
+                : desperate ? 3 : context.boost.isBoosted() ? Math.max(5, context.boost.getGuaranteedBoostTicks()) : Baritone.settings().elytraSimulationTicks.value;
         tests.add(new IntTriple(ticks, context.boost.isBoosted() ? ticks : 0, 0));
 
         final Optional<PitchResult> result = tests.stream()
@@ -1084,11 +1896,11 @@ public final class ElytraBehavior implements Helper {
                 .filter(Objects::nonNull)
                 .findFirst();
         if (result.isPresent()) {
-            return new Pair<>(result.get().pitch, false);
+            return new PitchSolveResult(result.get(), false);
         }
 
         // If we used a firework would we be able to get out of the current situation??? perhaps
-        if (desperate) {
+        if (desperate && !context.landingMode) {
             final List<IntTriple> testsBoost = new ArrayList<>();
             testsBoost.add(new IntTriple(ticks, 10, 3));
             testsBoost.add(new IntTriple(ticks, 10, 2));
@@ -1099,7 +1911,7 @@ public final class ElytraBehavior implements Helper {
                     .filter(Objects::nonNull)
                     .findFirst();
             if (resultBoost.isPresent()) {
-                return new Pair<>(resultBoost.get().pitch, true);
+                return new PitchSolveResult(resultBoost.get(), true);
             }
         }
 
@@ -1108,7 +1920,7 @@ public final class ElytraBehavior implements Helper {
 
     private PitchResult solvePitch(final SolverContext context, final Vec3 goal, final int relaxation,
                                    final FloatIterator pitches, final int ticks, final int ticksBoosted,
-                                   final int ticksBoostDelay) {
+                                   final int ticksBoostDelay, final boolean requireTouchdown) {
         // we are at a certain velocity, but we have a target velocity
         // what pitch would get us closest to our target velocity?
         // yaw is easy so we only care about pitch
@@ -1120,7 +1932,7 @@ public final class ElytraBehavior implements Helper {
 
         while (pitches.hasNext()) {
             final float pitch = pitches.nextFloat();
-            final List<Vec3> displacement = this.simulate(
+            final SimulationResult simulation = this.simulate(
                     context,
                     goalDelta,
                     pitch,
@@ -1128,22 +1940,32 @@ public final class ElytraBehavior implements Helper {
                     ticksBoosted,
                     ticksBoostDelay
             );
-            if (displacement == null) {
+            if (simulation == null) {
                 continue;
             }
+            final List<Vec3> displacement = simulation.steps;
             final Vec3 last = displacement.get(displacement.size() - 1);
             double goodness = goalDirection.dot(last.normalize());
-            if (landingMode) {
-                goodness = -goalDelta.subtract(last).length();
+            LandingPrediction landingPrediction = null;
+            if (requireTouchdown) {
+                landingPrediction = simulation.landing;
+                if (landingPrediction == null) {
+                    continue;
+                }
+                goodness = -landingPrediction.score;
             }
             final PitchResult bestSoFar = bestResults.peek();
             if (bestSoFar == null || goodness > bestSoFar.dot) {
-                bestResults.push(new PitchResult(pitch, goodness, displacement));
+                bestResults.push(new PitchResult(pitch, goodness, displacement, landingPrediction));
             }
         }
 
         outer:
         for (final PitchResult result : bestResults) {
+            if (requireTouchdown) {
+                this.simulationLine = result.steps;
+                return result;
+            }
             if (relaxation < 2) {
                 // Ensure that the goal is visible along the entire simulated path
                 // Reverse order iteration since the last position is most likely to fail
@@ -1165,8 +1987,8 @@ public final class ElytraBehavior implements Helper {
         return null;
     }
 
-    private List<Vec3> simulate(final SolverContext context, final Vec3 goalDelta, final float pitch, final int ticks,
-                                final int ticksBoosted, final int ticksBoostDelay) {
+    private SimulationResult simulate(final SolverContext context, final Vec3 goalDelta, final float pitch, final int ticks,
+                                      final int ticksBoosted, final int ticksBoostDelay) {
         final ITickableAimProcessor aimProcessor = context.aimProcessor.fork();
         Vec3 delta = goalDelta;
         Vec3 motion = context.motion;
@@ -1174,6 +1996,7 @@ public final class ElytraBehavior implements Helper {
         List<Vec3> displacement = new ArrayList<>(ticks + 1);
         displacement.add(Vec3.ZERO);
         int remainingTicksBoosted = ticksBoosted;
+        final double touchdownY = this.landingTarget != null ? this.landingTarget.y + 1.0D : Double.NEGATIVE_INFINITY;
 
         for (int i = 0; i < ticks; i++) {
             final double cx = hitbox.minX + (hitbox.maxX - hitbox.minX) * 0.5D;
@@ -1188,6 +2011,11 @@ public final class ElytraBehavior implements Helper {
 
             motion = step(motion, lookDirection, rotation.getPitch());
             delta = delta.subtract(motion);
+            final Vec3 currentOffset = displacement.get(displacement.size() - 1);
+            final AABB nextHitbox = hitbox.move(motion);
+            final boolean landingTouchdown = context.landingMode && this.landingTarget != null
+                    && hitbox.minY > touchdownY
+                    && nextHitbox.minY <= touchdownY;
 
             // Collision box while the player is in motion, with additional padding for safety
             final AABB inMotion = hitbox.inflate(motion.x, motion.y, motion.z).inflate(0.01);
@@ -1202,14 +2030,27 @@ public final class ElytraBehavior implements Helper {
                 for (int y = ymin; y < ymax; y++) {
                     for (int z = zmin; z < zmax; z++) {
                         if (!this.passable(x, y, z, context.ignoreLava)) {
+                            if (landingTouchdown && y + 1.0D <= touchdownY + 1.0E-6D) {
+                                continue;
+                            }
                             return null;
                         }
                     }
                 }
             }
 
-            hitbox = hitbox.move(motion);
-            displacement.add(displacement.get(displacement.size() - 1).add(motion));
+            if (landingTouchdown) {
+                final double denominator = hitbox.minY - nextHitbox.minY;
+                final double interpolation = denominator <= 1.0E-6D
+                        ? 1.0D
+                        : Mth.clamp((hitbox.minY - touchdownY) / denominator, 0.0D, 1.0D);
+                final Vec3 touchdownOffset = currentOffset.add(motion.scale(interpolation));
+                displacement.add(touchdownOffset);
+                return new SimulationResult(displacement, motion, this.createLandingPrediction(context, touchdownOffset, motion));
+            }
+
+            hitbox = nextHitbox;
+            displacement.add(currentOffset.add(motion));
 
             if (i >= ticksBoostDelay && remainingTicksBoosted-- > 0) {
                 // See EntityFireworkRocket
@@ -1221,7 +2062,48 @@ public final class ElytraBehavior implements Helper {
             }
         }
 
-        return displacement;
+        return new SimulationResult(displacement, motion, null);
+    }
+
+    private LandingPrediction createLandingPrediction(final SolverContext context, final Vec3 touchdownOffset, final Vec3 impactMotion) {
+        if (this.landingTarget == null) {
+            return null;
+        }
+        final Vec3 landingCenter = new Vec3(this.landingTarget.x + 0.5D, this.landingTarget.y + 1.0D, this.landingTarget.z + 0.5D);
+        final Vec3 touchdown = context.start.add(touchdownOffset);
+        Vec3 runwayDir = context.motion.multiply(1.0D, 0.0D, 1.0D);
+        if (runwayDir.lengthSqr() < 1.0E-6D) {
+            runwayDir = new Vec3(landingCenter.x - context.start.x, 0.0D, landingCenter.z - context.start.z);
+        }
+        if (runwayDir.lengthSqr() < 1.0E-6D) {
+            runwayDir = new Vec3(1.0D, 0.0D, 0.0D);
+        } else {
+            runwayDir = runwayDir.normalize();
+        }
+        final Vec3 lateralDir = new Vec3(-runwayDir.z, 0.0D, runwayDir.x);
+        final Vec3 touchdownDelta = new Vec3(touchdown.x - landingCenter.x, 0.0D, touchdown.z - landingCenter.z);
+        final double alongError = touchdownDelta.dot(runwayDir);
+        final double crossError = touchdownDelta.dot(lateralDir);
+        final double downwardSpeed = Math.max(0.0D, -impactMotion.y);
+        final double horizontalSpeed = impactMotion.multiply(1.0D, 0.0D, 1.0D).length();
+        final double projectedCarry = Math.max(0.0D, horizontalSpeed - 0.65D) * 4.0D;
+        final double projectedStopError = alongError + projectedCarry;
+        final double verticalPenalty = Math.max(0.0D, downwardSpeed - 0.42D);
+        final double stopPenalty = Math.max(0.0D, Math.abs(projectedStopError) - 1.5D);
+        final double crossPenalty = Math.max(0.0D, Math.abs(crossError) - 1.25D);
+        final boolean safeTouchdown = downwardSpeed <= 0.42D
+                && horizontalSpeed <= 1.8D
+                && Math.abs(projectedStopError) <= 3.0D
+                && Math.abs(crossError) <= 2.0D;
+        double score = verticalPenalty * verticalPenalty * 1800.0D
+                + stopPenalty * stopPenalty * 80.0D
+                + crossPenalty * crossPenalty * 120.0D
+                + alongError * alongError * 6.0D
+                + crossError * crossError * 14.0D;
+        if (!safeTouchdown) {
+            score += 5000.0D;
+        }
+        return new LandingPrediction(touchdown, impactMotion, alongError, crossError, projectedStopError, downwardSpeed, horizontalSpeed, safeTouchdown, score);
     }
 
     private static Vec3 step(final Vec3 motion, final Vec3 lookDirection, final float pitch) {
@@ -1264,12 +2146,78 @@ public final class ElytraBehavior implements Helper {
     }
 
     private boolean passable(int x, int y, int z, boolean ignoreLava) {
+        final BlockState state = this.bsi.get0(x, y, z);
         if (ignoreLava) {
-            final BlockState state = this.bsi.get0(x, y, z);
             return state.getBlock() instanceof AirBlock || MovementHelper.isLava(state);
-        } else {
+        }
+        if (this.boi != null) {
             return !this.boi.get0(x, y, z);
         }
+        if (!state.getFluidState().isEmpty()) {
+            return false;
+        }
+        return state.getCollisionShape(ctx.world(), new BlockPos(x, y, z)).isEmpty();
+    }
+
+    private boolean voxelRaytraceClear(final Vec3 start, final Vec3 end, final boolean ignoreLava) {
+        if (start.equals(end)) {
+            return true;
+        }
+
+        int x = fastFloor(start.x);
+        int y = fastFloor(start.y);
+        int z = fastFloor(start.z);
+        final int endX = fastFloor(end.x);
+        final int endY = fastFloor(end.y);
+        final int endZ = fastFloor(end.z);
+
+        if (!this.passable(x, y, z, ignoreLava)) {
+            return false;
+        }
+
+        final double dx = end.x - start.x;
+        final double dy = end.y - start.y;
+        final double dz = end.z - start.z;
+
+        final int stepX = Integer.compare((int) Math.signum(dx), 0);
+        final int stepY = Integer.compare((int) Math.signum(dy), 0);
+        final int stepZ = Integer.compare((int) Math.signum(dz), 0);
+
+        double tMaxX = this.intBound(start.x, dx);
+        double tMaxY = this.intBound(start.y, dy);
+        double tMaxZ = this.intBound(start.z, dz);
+
+        final double tDeltaX = stepX == 0 ? Double.POSITIVE_INFINITY : Math.abs(1.0D / dx);
+        final double tDeltaY = stepY == 0 ? Double.POSITIVE_INFINITY : Math.abs(1.0D / dy);
+        final double tDeltaZ = stepZ == 0 ? Double.POSITIVE_INFINITY : Math.abs(1.0D / dz);
+
+        while (x != endX || y != endY || z != endZ) {
+            if (tMaxX <= tMaxY && tMaxX <= tMaxZ) {
+                x += stepX;
+                tMaxX += tDeltaX;
+            } else if (tMaxY <= tMaxZ) {
+                y += stepY;
+                tMaxY += tDeltaY;
+            } else {
+                z += stepZ;
+                tMaxZ += tDeltaZ;
+            }
+            if (!this.passable(x, y, z, ignoreLava)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private double intBound(final double value, final double step) {
+        if (step == 0.0D) {
+            return Double.POSITIVE_INFINITY;
+        }
+        final double fraction = value - Math.floor(value);
+        if (step > 0.0D) {
+            return (1.0D - fraction) / step;
+        }
+        return fraction / -step;
     }
 
     private void tickInventoryTransactions() {

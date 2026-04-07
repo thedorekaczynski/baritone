@@ -95,6 +95,12 @@ public interface IBaritone {
     IGetToBlockProcess getGetToBlockProcess();
 
     /**
+     * @return The {@link ISentryProcess} instance
+     * @see ISentryProcess
+     */
+    ISentryProcess getSentryProcess();
+
+    /**
      * @return The {@link IElytraProcess} instance
      * @see IElytraProcess
      */
