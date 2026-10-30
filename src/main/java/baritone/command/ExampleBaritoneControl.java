@@ -38,8 +38,9 @@ import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.HoverEvent;
 import net.minecraft.network.chat.MutableComponent;
-import net.minecraft.util.Tuple;
-import net.minecraft.util.Util;
+import baritone.api.utils.Tuple;
+import com.mojang.blaze3d.Blaze3D;
+import java.net.URI;
 
 import java.util.List;
 import java.util.Locale;
@@ -96,7 +97,7 @@ public class ExampleBaritoneControl extends Behavior implements Helper {
             return false;
         } else if (msg.trim().equalsIgnoreCase("orderpizza")) {
             try {
-                Util.getPlatform().openUri("https://www.dominos.com/en/pages/order/");
+                Blaze3D.openUri(URI.create("https://www.dominos.com/en/pages/order/"));
             } catch (Exception ignored) {}
             return false;
         }
@@ -107,8 +108,9 @@ public class ExampleBaritoneControl extends Behavior implements Helper {
         String command = pair.getA();
         String rest = msg.substring(pair.getA().length());
         ArgConsumer argc = new ArgConsumer(this.manager, pair.getB());
+        Settings.Setting<?> shorthandSetting = getSettingShorthand(command);
         if (!argc.hasAny()) {
-            Settings.Setting setting = settings.byLowerName.get(command.toLowerCase(Locale.US));
+            Settings.Setting<?> setting = shorthandSetting;
             if (setting != null) {
                 logRanCommand(command, rest);
                 if (setting.getValueClass() == Boolean.class) {
@@ -118,19 +120,12 @@ public class ExampleBaritoneControl extends Behavior implements Helper {
                 }
                 return true;
             }
-        } else if (argc.hasExactlyOne()) {
-            for (Settings.Setting setting : settings.allSettings) {
-                if (setting.isJavaOnly()) {
-                    continue;
-                }
-                if (setting.getName().equalsIgnoreCase(pair.getA())) {
-                    logRanCommand(command, rest);
-                    try {
-                        this.manager.execute(String.format("set %s %s", setting.getName(), argc.getString()));
-                    } catch (CommandNotEnoughArgumentsException ignored) {} // The operation is safe
-                    return true;
-                }
-            }
+        } else if (argc.hasExactlyOne() && shorthandSetting != null) {
+            logRanCommand(command, rest);
+            try {
+                this.manager.execute(String.format("set %s %s", shorthandSetting.getName(), argc.getString()));
+            } catch (CommandNotEnoughArgumentsException ignored) {} // The operation is safe
+            return true;
         }
 
         // If the command exists, then handle echoing the input
@@ -139,6 +134,17 @@ public class ExampleBaritoneControl extends Behavior implements Helper {
         }
 
         return this.manager.execute(pair);
+    }
+
+    private Settings.Setting<?> getSettingShorthand(String token) {
+        if (this.manager.getCommand(token) != null) {
+            return null;
+        }
+        Settings.Setting<?> setting = settings.byLowerName.get(token.toLowerCase(Locale.US));
+        if (setting == null || setting.isJavaOnly()) {
+            return null;
+        }
+        return setting;
     }
 
     @Override
@@ -168,12 +174,16 @@ public class ExampleBaritoneControl extends Behavior implements Helper {
                 if (argc.hasExactly(1)) {
                     return new TabCompleteHelper()
                             .addCommands(this.manager)
-                            .addSettings()
+                            .append(settings.allSettings.stream()
+                                    .filter(setting -> !setting.isJavaOnly())
+                                    .map(Settings.Setting::getName)
+                                    .filter(name -> this.manager.getCommand(name) == null)
+                                    .sorted(String.CASE_INSENSITIVE_ORDER))
                             .filterPrefix(argc.getString())
                             .stream();
                 }
-                Settings.Setting setting = settings.byLowerName.get(argc.getString().toLowerCase(Locale.US));
-                if (setting != null && !setting.isJavaOnly()) {
+                Settings.Setting<?> setting = getSettingShorthand(argc.getString());
+                if (setting != null) {
                     if (setting.getValueClass() == Boolean.class) {
                         TabCompleteHelper helper = new TabCompleteHelper();
                         if ((Boolean) setting.value) {

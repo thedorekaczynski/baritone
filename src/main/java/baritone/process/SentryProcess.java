@@ -33,6 +33,7 @@ import baritone.utils.BaritoneProcessHelper;
 import net.minecraft.core.Direction;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.NeutralMob;
@@ -306,7 +307,7 @@ public final class SentryProcess extends BaritoneProcessHelper implements ISentr
         }
         ctx.playerController().syncHeldItem();
         ctx.minecraft().gameMode.attack(ctx.player(), threat);
-        ctx.player().swing(InteractionHand.MAIN_HAND);
+        ctx.player().swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
         return true;
     }
 

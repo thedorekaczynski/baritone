@@ -31,7 +31,7 @@ import baritone.utils.BlockStateInterface;
 import baritone.utils.IRenderer;
 import baritone.utils.PathRenderer;
 import baritone.utils.accessor.IFireworkRocketEntity;
-import com.mojang.blaze3d.vertex.BufferBuilder;
+import baritone.utils.IRenderer.LineBuffer;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.floats.FloatIterator;
 import net.minecraft.core.BlockPos;
@@ -75,6 +75,7 @@ public final class ElytraBehavior implements Helper {
     private final IPlayerContext ctx;
 
     // Render stuff
+    private final List<Pair<Vec3, Vec3>> chosenLines;
     private final List<Pair<Vec3, Vec3>> clearLines;
     private final List<Pair<Vec3, Vec3>> blockedLines;
     private List<Vec3> simulationLine;
@@ -96,6 +97,11 @@ public final class ElytraBehavior implements Helper {
      * Remaining cool-down ticks after the player's position and rotation are reset by the server
      */
     private int remainingSetBackTicks;
+
+    /**
+     * Remaining ticks to suppress firework usage after colliding with terrain while fall flying.
+     */
+    private int remainingCollisionRecoveryTicks;
 
     public boolean landingMode;
 
@@ -132,6 +138,7 @@ public final class ElytraBehavior implements Helper {
         debug("behavior ctor start dim=" + baritone.getPlayerContext().world().dimension() + " dest=" + destination + " append=" + appendDestination);
         this.baritone = baritone;
         this.ctx = baritone.getPlayerContext();
+        this.chosenLines = new CopyOnWriteArrayList<>();
         this.clearLines = new CopyOnWriteArrayList<>();
         this.blockedLines = new CopyOnWriteArrayList<>();
         this.pathManager = this.new PathManager();
@@ -260,7 +267,7 @@ public final class ElytraBehavior implements Helper {
                             final Throwable cause = ex.getCause();
                             if (cause instanceof PathCalculationException) {
                                 logDirect("Failed to compute next segment");
-                                if (ctx.player().distanceToSqr(pathStart.getCenter()) < 16 * 16) {
+                                if (ctx.player().distanceToSqr(Vec3.atCenterOf(pathStart)) < 16 * 16) {
                                     logVerbose("Player is near the segment start, therefore repeating this calculation is pointless. Marking as complete");
                                     completePath = true;
                                 }
@@ -450,6 +457,10 @@ public final class ElytraBehavior implements Helper {
         return this.landingTarget;
     }
 
+    public boolean isInCollisionRecovery() {
+        return this.remainingCollisionRecoveryTicks > 0;
+    }
+
     public boolean shouldBeginLanding() {
         if (this.landingTarget == null) {
             return false;
@@ -461,7 +472,7 @@ public final class ElytraBehavior implements Helper {
         final double leadDistance = this.waterLandingTarget
                 ? Mth.clamp(horizontalSpeed * 32.0D + downwardSpeed * 20.0D + Math.max(0.0D, altitudeAbovePad - 6.0D) * 0.45D + 28.0D, 36.0D, 128.0D)
                 : Mth.clamp(horizontalSpeed * 26.0D + downwardSpeed * 18.0D + Math.max(0.0D, altitudeAbovePad - 6.0D) * 0.35D + 18.0D, 28.0D, 96.0D);
-        return this.horizontalDistanceSq(ctx.player().position(), this.destination.getCenter()) < leadDistance * leadDistance;
+        return this.horizontalDistanceSq(ctx.player().position(), Vec3.atCenterOf(this.destination)) < leadDistance * leadDistance;
     }
 
     public long getNetherSeed() {
@@ -565,6 +576,14 @@ public final class ElytraBehavior implements Helper {
         return Math.min(cruiseY, dst.getY() + approachOffset);
     }
 
+    private List<Pair<Vec3, Vec3>> getRenderedDebugLines(List<Pair<Vec3, Vec3>> lines) {
+        int limit = Baritone.settings().elytraLines.value;
+        if (limit <= 0 || lines.size() <= limit) {
+            return lines;
+        }
+        return lines.subList(lines.size() - limit, lines.size());
+    }
+
     private int sampleLocalTerrainMaxY(final BlockPos src, final BlockPos dst, final double centerT, final int spacing) {
         final double dx = dst.getX() - src.getX();
         final double dz = dst.getZ() - src.getZ();
@@ -624,22 +643,29 @@ public final class ElytraBehavior implements Helper {
         if (this.aimPos != null) {
             PathRenderer.drawGoal(event.getModelViewStack(), ctx, new GoalBlock(this.aimPos), event.getPartialTicks(), Color.GREEN);
         }
+        if (Baritone.settings().elytraGreenLine.value && !this.chosenLines.isEmpty()) {
+            LineBuffer bufferBuilder = IRenderer.startLines(new Color(0x00FF66));
+            for (Pair<Vec3, Vec3> line : this.chosenLines) {
+                IRenderer.emitLine(bufferBuilder, event.getModelViewStack(), line.first(), line.second(), settings.pathRenderLineWidthPixels.value + 1.0F);
+            }
+            IRenderer.endLines(bufferBuilder, settings.renderPathIgnoreDepth.value);
+        }
         if (!this.clearLines.isEmpty() && settings.elytraRenderRaytraces.value) {
-            BufferBuilder bufferBuilder = IRenderer.startLines(Color.GREEN);
-            for (Pair<Vec3, Vec3> line : this.clearLines) {
+            LineBuffer bufferBuilder = IRenderer.startLines(Color.GREEN);
+            for (Pair<Vec3, Vec3> line : this.getRenderedDebugLines(this.clearLines)) {
                 IRenderer.emitLine(bufferBuilder, event.getModelViewStack(), line.first(), line.second(), settings.pathRenderLineWidthPixels.value);
             }
             IRenderer.endLines(bufferBuilder, settings.renderPathIgnoreDepth.value);
         }
         if (!this.blockedLines.isEmpty() && Baritone.settings().elytraRenderRaytraces.value) {
-            BufferBuilder bufferBuilder = IRenderer.startLines(Color.BLUE);
-            for (Pair<Vec3, Vec3> line : this.blockedLines) {
+            LineBuffer bufferBuilder = IRenderer.startLines(Color.BLUE);
+            for (Pair<Vec3, Vec3> line : this.getRenderedDebugLines(this.blockedLines)) {
                 IRenderer.emitLine(bufferBuilder, event.getModelViewStack(), line.first(), line.second(), settings.pathRenderLineWidthPixels.value);
             }
             IRenderer.endLines(bufferBuilder, settings.renderPathIgnoreDepth.value);
         }
         if (this.simulationLine != null && Baritone.settings().elytraRenderSimulation.value) {
-            BufferBuilder bufferBuilder = IRenderer.startLines(new Color(0x36CCDC));
+            LineBuffer bufferBuilder = IRenderer.startLines(new Color(0x36CCDC));
             final Vec3 offset = ctx.player().getPosition(event.getPartialTicks());
             for (int i = 0; i < this.simulationLine.size() - 1; i++) {
                 final Vec3 src = this.simulationLine.get(i).add(offset);
@@ -769,11 +795,15 @@ public final class ElytraBehavior implements Helper {
             if (this.remainingSetBackTicks > 0) {
                 this.remainingSetBackTicks--;
             }
+            if (this.remainingCollisionRecoveryTicks > 0) {
+                this.remainingCollisionRecoveryTicks--;
+            }
             if (!this.getAttachedFirework().isPresent()) {
                 this.minimumBoostTicks = 0;
             }
 
             // Reset rendered elements
+            this.chosenLines.clear();
             this.clearLines.clear();
             this.blockedLines.clear();
             this.visiblePath = null;
@@ -835,6 +865,9 @@ public final class ElytraBehavior implements Helper {
             if (ctx.player().verticalCollision) {
                 logVerbose("vbonk");
             }
+            if (ctx.player().isFallFlying() && (ctx.player().horizontalCollision || ctx.player().verticalCollision)) {
+                this.remainingCollisionRecoveryTicks = Math.max(this.remainingCollisionRecoveryTicks, 12);
+            }
 
             final SolverContext solverContext = this.new SolverContext(false);
             this.solveNextTick = true;
@@ -880,20 +913,21 @@ public final class ElytraBehavior implements Helper {
             }
 
             baritone.getLookBehavior().updateTarget(solution.rotation, false);
-            debug("tick solution goingTo=" + solution.goingTo + " solvedPitch=" + solution.solvedPitch + " forceFw=" + solution.forceUseFirework);
+            debug("tick solution goingTo=" + solution.goingTo + " solvedPitch=" + solution.solvedPitch + " fireworkUrgency=" + solution.fireworkUrgency);
 
             if (!solution.solvedPitch) {
                 logVerbose("no pitch solution, probably gonna crash in a few ticks LOL!!!");
                 return;
             } else {
                 this.aimPos = new BetterBlockPos(solution.goingTo.x, solution.goingTo.y, solution.goingTo.z);
+                this.chosenLines.add(new Pair<>(solution.context.start, solution.goingTo));
             }
 
             this.tickUseFireworks(
                     solution.context.start,
                     solution.goingTo,
                     solution.context.boost.isBoosted(),
-                    solution.forceUseFirework || inLava
+                    FireworkUrgency.max(solution.fireworkUrgency, inLava ? FireworkUrgency.EMERGENCY : FireworkUrgency.NONE)
             );
         } catch (Throwable t) {
             debug("tick threw " + t.getClass().getName() + ": " + t.getMessage());
@@ -1150,12 +1184,9 @@ public final class ElytraBehavior implements Helper {
         return Mth.clamp(basePitch - correction, -45.0F, 35.0F);
     }
 
-    private boolean shouldForceOverworldFirework(final double desiredAltitude, final Vec3 target, final boolean isBoosted, final boolean landing) {
-        if (landing) {
-            return false;
-        }
-        if (isBoosted) {
-            return false;
+    private FireworkUrgency computeOverworldFireworkUrgency(final double desiredAltitude, final Vec3 target, final boolean isBoosted, final boolean landing) {
+        if (landing || isBoosted) {
+            return FireworkUrgency.NONE;
         }
         final double altitudeError = desiredAltitude - ctx.player().position().y;
         final double terrainClearance = ctx.player().position().y - (this.sampleTerrainAhead(target) - Baritone.settings().elytraOverworldTerrainClearance.value);
@@ -1164,10 +1195,13 @@ public final class ElytraBehavior implements Helper {
         final double fireworkSpeed = Baritone.settings().elytraFireworkSpeed.value;
         final boolean severeTerrainRisk = terrainClearance < Math.max(4, Baritone.settings().elytraOverworldTerrainClearance.value / 3) && verticalVelocity < -0.20D;
         final boolean badlyBelowCruise = altitudeError > 18.0D && verticalVelocity < -0.25D && horizontalSpeed < fireworkSpeed * 1.15D;
-        if (!Baritone.settings().elytraConserveFireworks.value) {
-            return severeTerrainRisk || badlyBelowCruise;
+        if (severeTerrainRisk) {
+            return FireworkUrgency.EMERGENCY;
         }
-        return severeTerrainRisk;
+        if (!Baritone.settings().elytraConserveFireworks.value && badlyBelowCruise) {
+            return FireworkUrgency.DISCRETIONARY;
+        }
+        return FireworkUrgency.NONE;
     }
 
     private double horizontalDistanceSq(final Vec3 first, final Vec3 second) {
@@ -1217,9 +1251,11 @@ public final class ElytraBehavior implements Helper {
         final float pitch = solvedPitch != null
                 ? solvedPitch.result.pitch
                 : this.computeOverworldPitch(rawRotation.getPitch(), desiredAltitude, context.landingMode);
-        final boolean forceUseFirework = (solvedPitch != null && solvedPitch.forceUseFirework)
-                || this.shouldForceOverworldFirework(desiredAltitude, controlTarget, context.boost.isBoosted(), context.landingMode);
-        return new Solution(context, new Rotation(rawRotation.getYaw(), pitch), controlTarget, true, forceUseFirework);
+        final FireworkUrgency fireworkUrgency = FireworkUrgency.max(
+                solvedPitch != null ? solvedPitch.fireworkUrgency : FireworkUrgency.NONE,
+                this.computeOverworldFireworkUrgency(desiredAltitude, controlTarget, context.boost.isBoosted(), context.landingMode)
+        );
+        return new Solution(context, new Rotation(rawRotation.getYaw(), pitch), controlTarget, true, fireworkUrgency);
     }
 
     private Solution solveOverworldLandingAngles(final SolverContext context, final NetherPath path) {
@@ -1248,7 +1284,7 @@ public final class ElytraBehavior implements Helper {
             }
         }
         if (bestTouchdown != null) {
-            return new Solution(context, new Rotation(bestTouchdown.yaw, bestTouchdown.solve.result.pitch), bestTouchdown.candidate.target, true, false);
+            return new Solution(context, new Rotation(bestTouchdown.yaw, bestTouchdown.solve.result.pitch), bestTouchdown.candidate.target, true, bestTouchdown.solve.fireworkUrgency);
         }
 
         Solution fallback = null;
@@ -1256,10 +1292,10 @@ public final class ElytraBehavior implements Helper {
             final Rotation rawRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), candidate.target, ctx.playerRotations());
             final PitchSolveResult solvedPitch = this.solvePitch(context, candidate.target, 1, false);
             if (solvedPitch != null) {
-                return new Solution(context, new Rotation(rawRotation.getYaw(), solvedPitch.result.pitch), candidate.target, true, false);
+                return new Solution(context, new Rotation(rawRotation.getYaw(), solvedPitch.result.pitch), candidate.target, true, solvedPitch.fireworkUrgency);
             }
             if (fallback == null) {
-                fallback = new Solution(context, new Rotation(rawRotation.getYaw(), rawRotation.getPitch()), candidate.target, false, false);
+                fallback = new Solution(context, new Rotation(rawRotation.getYaw(), rawRotation.getPitch()), candidate.target, false, FireworkUrgency.NONE);
             }
         }
         if (fallback != null) {
@@ -1267,7 +1303,7 @@ public final class ElytraBehavior implements Helper {
         }
         final Vec3 fallbackTarget = this.buildLandingControlTarget(profile, profile.approachDistance, profile.approachHeight);
         final Rotation rawRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), fallbackTarget, ctx.playerRotations());
-        return new Solution(context, new Rotation(rawRotation.getYaw(), rawRotation.getPitch()), fallbackTarget, false, false);
+        return new Solution(context, new Rotation(rawRotation.getYaw(), rawRotation.getPitch()), fallbackTarget, false, FireworkUrgency.NONE);
     }
 
     private Solution solveOverworldWaterLandingAngles(final SolverContext context) {
@@ -1293,6 +1329,7 @@ public final class ElytraBehavior implements Helper {
 
         final Vec3 target;
         final float pitch;
+        final FireworkUrgency fireworkUrgency;
         if (horizontalDistance > 6.0D) {
             final double setupDistance = Mth.clamp(horizontalSpeed * 8.0D + altitudeAbovePad * 0.08D + 6.0D, 6.0D, 20.0D);
             final double setupHeight = Mth.clamp(8.0D + horizontalSpeed * 5.0D + downwardSpeed * 6.0D, 8.0D, 28.0D);
@@ -1301,14 +1338,16 @@ public final class ElytraBehavior implements Helper {
             final Rotation rawRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), target, ctx.playerRotations());
             final PitchSolveResult solvedPitch = this.solvePitch(context, target, 1, false);
             pitch = solvedPitch != null ? solvedPitch.result.pitch : rawRotation.getPitch();
+            fireworkUrgency = solvedPitch != null ? solvedPitch.fireworkUrgency : FireworkUrgency.NONE;
         } else {
             target = landingCenter.add(0.0D, -4.0D, 0.0D);
             final Rotation rawRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), target, ctx.playerRotations());
             pitch = Mth.clamp(Math.max(rawRotation.getPitch(), 65.0F), 60.0F, 85.0F);
+            fireworkUrgency = FireworkUrgency.NONE;
         }
 
         final Rotation finalRotation = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), target, ctx.playerRotations()).withPitch(pitch);
-        return new Solution(context, finalRotation, target, true, false);
+        return new Solution(context, finalRotation, target, true, fireworkUrgency);
     }
 
     private Solution solveNetherAngles(final SolverContext context) {
@@ -1385,12 +1424,12 @@ public final class ElytraBehavior implements Helper {
 
                         final PitchSolveResult pitch = this.solvePitch(context, dest, relaxation);
                         if (pitch == null) {
-                            solution = new Solution(context, new Rotation(yaw, ctx.playerRotations().getPitch()), null, false, false);
+                            solution = new Solution(context, new Rotation(yaw, ctx.playerRotations().getPitch()), null, false, FireworkUrgency.NONE);
                             continue;
                         }
 
                         // A solution was found with yaw AND pitch, so just immediately return it.
-                        return new Solution(context, new Rotation(yaw, pitch.result.pitch), dest, true, pitch.forceUseFirework);
+                        return new Solution(context, new Rotation(yaw, pitch.result.pitch), dest, true, pitch.fireworkUrgency);
                     }
                 }
             }
@@ -1398,9 +1437,13 @@ public final class ElytraBehavior implements Helper {
         return solution;
     }
 
-    private void tickUseFireworks(final Vec3 start, final Vec3 goingTo, final boolean isBoosted, final boolean forceUseFirework) {
+    private void tickUseFireworks(final Vec3 start, final Vec3 goingTo, final boolean isBoosted, final FireworkUrgency fireworkUrgency) {
         if (this.remainingSetBackTicks > 0) {
             logDebug("waiting for elytraFireworkSetbackUseDelay: " + this.remainingSetBackTicks);
+            return;
+        }
+        if (this.remainingCollisionRecoveryTicks > 0 && !fireworkUrgency.bypassesCollisionRecovery()) {
+            logDebug("waiting for collision recovery: " + this.remainingCollisionRecoveryTicks);
             return;
         }
         if (this.landingMode) {
@@ -1415,7 +1458,7 @@ public final class ElytraBehavior implements Helper {
         ).lengthSqr();
 
         final double elytraFireworkSpeed = Baritone.settings().elytraFireworkSpeed.value;
-        if (this.remainingFireworkTicks <= 0 && (forceUseFirework || (!isBoosted
+        if (this.remainingFireworkTicks <= 0 && (fireworkUrgency.requestsFirework() || (!isBoosted
                 && useOnDescend
                 && (ctx.player().position().y < goingTo.y - 5 || start.distanceTo(new Vec3(goingTo.x + 0.5, ctx.player().position().y, goingTo.z + 0.5)) > 5) // UGH!!!!!!!
                 && currentSpeed < elytraFireworkSpeed * elytraFireworkSpeed))
@@ -1427,7 +1470,7 @@ public final class ElytraBehavior implements Helper {
                 logDirect("no fireworks");
                 return;
             }
-            logVerbose("attempting to use firework" + (forceUseFirework ? " (forced)" : ""));
+            logVerbose("attempting to use firework" + (fireworkUrgency.requestsFirework() ? " (" + fireworkUrgency.name().toLowerCase(Locale.ROOT) + ")" : ""));
             ctx.playerController().processRightClick(ctx.player(), ctx.world(), InteractionHand.MAIN_HAND);
             this.minimumBoostTicks = 10 * (1 + getFireworkBoost(ctx.player().getItemInHand(InteractionHand.MAIN_HAND)).orElse(0));
             this.remainingFireworkTicks = 10;
@@ -1558,6 +1601,24 @@ public final class ElytraBehavior implements Helper {
         }
     }
 
+    private enum FireworkUrgency {
+        NONE,
+        DISCRETIONARY,
+        EMERGENCY;
+
+        private boolean requestsFirework() {
+            return this != NONE;
+        }
+
+        private boolean bypassesCollisionRecovery() {
+            return this == EMERGENCY;
+        }
+
+        private static FireworkUrgency max(FireworkUrgency first, FireworkUrgency second) {
+            return first.ordinal() >= second.ordinal() ? first : second;
+        }
+    }
+
     private static final class PitchResult {
 
         public final float pitch;
@@ -1576,11 +1637,11 @@ public final class ElytraBehavior implements Helper {
     private static final class PitchSolveResult {
 
         public final PitchResult result;
-        public final boolean forceUseFirework;
+        public final FireworkUrgency fireworkUrgency;
 
-        public PitchSolveResult(PitchResult result, boolean forceUseFirework) {
+        public PitchSolveResult(PitchResult result, FireworkUrgency fireworkUrgency) {
             this.result = result;
-            this.forceUseFirework = forceUseFirework;
+            this.fireworkUrgency = fireworkUrgency;
         }
     }
 
@@ -1683,14 +1744,14 @@ public final class ElytraBehavior implements Helper {
         public final Rotation rotation;
         public final Vec3 goingTo;
         public final boolean solvedPitch;
-        public final boolean forceUseFirework;
+        public final FireworkUrgency fireworkUrgency;
 
-        public Solution(SolverContext context, Rotation rotation, Vec3 goingTo, boolean solvedPitch, boolean forceUseFirework) {
+        public Solution(SolverContext context, Rotation rotation, Vec3 goingTo, boolean solvedPitch, FireworkUrgency fireworkUrgency) {
             this.context = context;
             this.rotation = rotation;
             this.goingTo = goingTo;
             this.solvedPitch = solvedPitch;
-            this.forceUseFirework = forceUseFirework;
+            this.fireworkUrgency = fireworkUrgency;
         }
     }
 
@@ -1896,7 +1957,7 @@ public final class ElytraBehavior implements Helper {
                 .filter(Objects::nonNull)
                 .findFirst();
         if (result.isPresent()) {
-            return new PitchSolveResult(result.get(), false);
+            return new PitchSolveResult(result.get(), FireworkUrgency.NONE);
         }
 
         // If we used a firework would we be able to get out of the current situation??? perhaps
@@ -1911,7 +1972,7 @@ public final class ElytraBehavior implements Helper {
                     .filter(Objects::nonNull)
                     .findFirst();
             if (resultBoost.isPresent()) {
-                return new PitchSolveResult(resultBoost.get(), true);
+                return new PitchSolveResult(resultBoost.get(), FireworkUrgency.EMERGENCY);
             }
         }
 

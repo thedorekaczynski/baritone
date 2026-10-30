@@ -301,12 +301,14 @@ public class MovementTraverse extends Movement {
             }
             double dist1 = Math.max(Math.abs(ctx.player().position().x - (dest.getX() + 0.5D)), Math.abs(ctx.player().position().z - (dest.getZ() + 0.5D)));
             PlaceResult p = MovementHelper.attemptToPlaceABlock(state, baritone, dest.below(), false, !Baritone.settings().assumeSafeWalk.value);
-            if ((p == PlaceResult.READY_TO_PLACE || dist1 < 0.6) && !Baritone.settings().assumeSafeWalk.value) {
+            // sneaking in water makes you swim down — skip it; can't fall off ledges while floating
+            boolean inWater = ctx.player().isInWater();
+            if ((p == PlaceResult.READY_TO_PLACE || dist1 < 0.6) && !Baritone.settings().assumeSafeWalk.value && !inWater) {
                 state.setInput(Input.SNEAK, true);
             }
             switch (p) {
                 case READY_TO_PLACE: {
-                    if (ctx.player().isCrouching() || Baritone.settings().assumeSafeWalk.value) {
+                    if (ctx.player().isCrouching() || Baritone.settings().assumeSafeWalk.value || inWater) {
                         state.setInput(Input.CLICK_RIGHT, true);
                     }
                     return state;

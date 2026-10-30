@@ -782,8 +782,12 @@ public interface MovementHelper extends ActionCosts, Helper {
         return false;
     }
 
-    static PlaceResult attemptToPlaceABlock(MovementState state, IBaritone baritone, BlockPos placeAt, boolean preferDown, boolean wouldSneak) {
+    public static PlaceResult attemptToPlaceABlock(MovementState state, IBaritone baritone, BlockPos placeAt, boolean preferDown, boolean wouldSneak) {
         IPlayerContext ctx = baritone.getPlayerContext();
+        // sneaking in water makes you swim down, not anchor — and you can't fall off an edge while floating
+        if (wouldSneak && ctx.player().isInWater()) {
+            wouldSneak = false;
+        }
         Optional<Rotation> direct = RotationUtils.reachable(ctx, placeAt, wouldSneak); // we assume that if there is a block there, it must be replacable
         boolean found = false;
         if (direct.isPresent()) {
@@ -838,7 +842,7 @@ public interface MovementHelper extends ActionCosts, Helper {
         return PlaceResult.NO_OPTION;
     }
 
-    enum PlaceResult {
+    public enum PlaceResult {
         READY_TO_PLACE, ATTEMPTING, NO_OPTION;
     }
 

@@ -91,7 +91,7 @@ public final class InputOverrideHandler extends Behavior implements IInputOverri
             setInputForceState(Input.CLICK_RIGHT, false);
         }
         blockBreakHelper.tick(isInputForcedDown(Input.CLICK_LEFT));
-        blockPlaceHelper.tick(isInputForcedDown(Input.CLICK_RIGHT));
+        blockPlaceHelper.tick(isInputForcedDown(Input.CLICK_RIGHT), isInputForcedDown(Input.SNEAK));
 
         if (inControl()) {
             if (ctx.player().input.getClass() != PlayerMovementInput.class) {

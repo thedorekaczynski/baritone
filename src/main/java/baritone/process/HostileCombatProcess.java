@@ -25,6 +25,7 @@ import baritone.api.utils.RotationUtils;
 import baritone.behavior.InventoryBehavior;
 import baritone.utils.BaritoneProcessHelper;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.NeutralMob;
@@ -91,7 +92,7 @@ public final class HostileCombatProcess extends BaritoneProcessHelper {
         }
         ctx.playerController().syncHeldItem();
         ctx.minecraft().gameMode.attack(ctx.player(), target);
-        ctx.player().swing(InteractionHand.MAIN_HAND);
+        ctx.player().swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
         return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
     }
 

@@ -84,6 +84,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private int configuredOverworldTerrainClearance;
     private boolean configuredOverworldWaterDive;
     private int landingRetryCooldownTicks;
+    private boolean reportedLandingMomentum;
 
     private static final int LANDING_RETRY_COOLDOWN_TICKS = 20;
     private static final double LANDING_FAILURE_DROP_BLOCKS = 4.0D;
@@ -111,6 +112,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.configuredOverworldTerrainClearance = 0;
         this.configuredOverworldWaterDive = false;
         this.landingRetryCooldownTicks = 0;
+        this.reportedLandingMomentum = false;
         destroyBehaviorAsync();
     }
 
@@ -147,6 +149,11 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
     @Override
     public PathingCommand onTick(boolean calcFailed, boolean isSafeToCancel) {
+        if (!ctx.player().isAlive()) {
+            baritone.getInputOverrideHandler().clearAllKeys();
+            this.onLostControl();
+            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+        }
         if (this.landingRetryCooldownTicks > 0) {
             this.landingRetryCooldownTicks--;
         }
@@ -200,7 +207,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                     && !this.goingToLandingSpot
                     && this.behavior.pathManager.isComplete()
                     && last != null
-                    && ctx.player().position().distanceToSqr(last.getCenter()) < (landingSetupDistance * landingSetupDistance)) {
+                    && ctx.player().position().distanceToSqr(Vec3.atCenterOf(last)) < (landingSetupDistance * landingSetupDistance)) {
                 logDirect("Path complete, picking a safe landing spot near the goal...");
                 BetterBlockPos landingSpot = findGoalLandingSpot();
                 if (landingSpot != null) {
@@ -242,30 +249,38 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         } else if (this.state == State.LANDING) {
             if (ctx.playerMotion().multiply(1, 0, 1).length() > 0.001) {
-                logDirect("Landed, but still moving, waiting for velocity to die down... ");
+                if (!this.reportedLandingMomentum) {
+                    logDirect("Landed, but still moving, waiting for velocity to die down... ");
+                    this.reportedLandingMomentum = true;
+                }
                 baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
                 return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
             }
+            this.reportedLandingMomentum = false;
             if (this.arrivalAfterLanding && !this.reachedGoal) {
                 Goal handoffGoal = this.missionGoal;
-                boolean goalSatisfied = handoffGoal == null || (handoffGoal.isInGoal(ctx.playerFeet()) && handoffGoal.isInGoal(baritone.getPathingBehavior().pathStart()));
-                if (!goalSatisfied && handoffGoal != null) {
+                boolean goalSatisfied = handoffGoal == null || handoffGoal.isInGoal(ctx.playerFeet());
+                if (!goalSatisfied && handoffGoal != null && Baritone.settings().elytraWalkToGoalOnLanding.value) {
                     logDirect("Landed safely, resuming ground path to complete the original goal");
                     baritone.getInputOverrideHandler().clearAllKeys();
                     this.onLostControl();
                     baritone.getCustomGoalProcess().setGoalAndPath(handoffGoal);
                     return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
                 }
-                if (Baritone.settings().notificationOnPathComplete.value) {
-                    logNotification("Pathing complete", false);
-                }
-                this.reachedGoal = true;
-                if (Baritone.settings().disconnectOnArrival.value) {
-                    this.onLostControl();
-                    if (ctx.world() instanceof ClientLevel clientLevel) {
-                        clientLevel.disconnect(Component.literal("[Baritone] Arrived at goal!"));
+                if (goalSatisfied) {
+                    if (Baritone.settings().notificationOnPathComplete.value) {
+                        logNotification("Pathing complete", false);
                     }
-                    return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+                    this.reachedGoal = true;
+                    if (Baritone.settings().disconnectOnArrival.value) {
+                        this.onLostControl();
+                        if (ctx.world() instanceof ClientLevel clientLevel) {
+                            clientLevel.disconnect(Component.literal("[Baritone] Arrived at goal!"));
+                        }
+                        return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+                    }
+                } else if (handoffGoal != null) {
+                    logDirect("Landed near the goal, but ground handoff is disabled");
                 }
             }
             logDirect("Done :)");
@@ -630,6 +645,12 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     @Override
     public void onReceivePacket(PacketEvent event) {
         if (this.behavior != null) this.behavior.onReceivePacket(event);
+    }
+
+    @Override
+    public void onPlayerDeath() {
+        baritone.getInputOverrideHandler().clearAllKeys();
+        this.onLostControl();
     }
 
     @Override

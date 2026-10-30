@@ -36,16 +36,10 @@ public class RenderCommand extends Command {
     @Override
     public void execute(String label, IArgConsumer args) throws CommandException {
         args.requireMax(0);
-        BetterBlockPos origin = ctx.playerFeet();
-        int renderDistance = (ctx.minecraft().options.renderDistance().get() + 1) * 16;
-        ctx.minecraft().levelRenderer.setBlocksDirty(
-                origin.x - renderDistance,
-                ctx.world().getMinY(),
-                origin.z - renderDistance,
-                origin.x + renderDistance,
-                ctx.world().getMaxY(),
-                origin.z + renderDistance
-        );
+        // 26.2: LevelRenderer.setBlocksDirty(x1,y1,z1,x2,y2,z2) was removed, so the
+        // area-bounded refresh is gone. resetLevelRenderData() rebuilds everything,
+        // which is a superset of what this command asked for.
+        ctx.minecraft().levelRenderer.resetLevelRenderData();
         logDirect("Done");
     }
 

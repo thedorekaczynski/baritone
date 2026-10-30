@@ -35,6 +35,7 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.AirBlock;
 import net.minecraft.world.level.block.Block;
@@ -62,6 +63,7 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
     private GoalRunAway branchPointRunaway;
     private int desiredQuantity;
     private boolean collectDrops;
+    private List<Item> savedThrowawayItems;
     private int tickCount;
 
     public MineProcess(Baritone baritone) {
@@ -85,24 +87,6 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
                 return null;
             }
         }
-        if (calcFailed) {
-            if (!knownOreLocations.isEmpty() && Baritone.settings().blacklistClosestOnFailure.value) {
-                logDirect("Unable to find any path to " + filter + ", blacklisting presumably unreachable closest instance...");
-                if (Baritone.settings().notificationOnMineFail.value) {
-                    logNotification("Unable to find any path to " + filter + ", blacklisting presumably unreachable closest instance...", true);
-                }
-                knownOreLocations.stream().min(Comparator.comparingDouble(ctx.playerFeet()::distSqr)).ifPresent(blacklist::add);
-                knownOreLocations.removeIf(blacklist::contains);
-            } else {
-                logDirect("Unable to find any path to " + filter + ", canceling mine");
-                if (Baritone.settings().notificationOnMineFail.value) {
-                    logNotification("Unable to find any path to " + filter + ", canceling mine", true);
-                }
-                cancel();
-                return null;
-            }
-        }
-
         updateLoucaSystem();
         List<BlockPos> dropped = droppedItemsScan();
         if (collectDrops && !dropped.isEmpty()) {
@@ -133,17 +117,40 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
                 .filter(pos -> !(BlockStateInterface.get(ctx, pos).getBlock() instanceof AirBlock)) // after breaking a block, it takes mineGoalUpdateInterval ticks for it to actually update this list =(
                 .min(Comparator.comparingDouble(ctx.playerFeet().above()::distSqr));
         baritone.getInputOverrideHandler().clearAllKeys();
+        DirectMineOpportunity directMineOpportunity = null;
         if (shaft.isPresent() && ctx.player().onGround()) {
             InternalMiningPlan plan = internalMiningPlan(shaft.get(), context, locs);
-            PathingCommand directMine = null;
             if (plan.directMineTarget != null) {
-                directMine = tryDirectMine(plan.directMineTarget, isSafeToCancel);
+                directMineOpportunity = directMineOpportunity(plan.directMineTarget);
             } else if (plan.goal().isInGoal(ctx.playerFeet())) {
                 // Avoid idling when the preferred branch is already satisfied but there is still a live target in this column.
-                directMine = tryDirectMine(shaft.get(), isSafeToCancel);
+                directMineOpportunity = directMineOpportunity(shaft.get());
             }
-            if (directMine != null) {
-                return directMine;
+            if (directMineOpportunity != null) {
+                if (isSafeToCancel) {
+                    return startDirectMine(directMineOpportunity);
+                }
+                if (calcFailed) {
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+            }
+        }
+        if (calcFailed) {
+            if (!locs.isEmpty() && Baritone.settings().blacklistClosestOnFailure.value) {
+                logDirect("Unable to find any path to " + filter + ", blacklisting presumably unreachable closest instance...");
+                if (Baritone.settings().notificationOnMineFail.value) {
+                    logNotification("Unable to find any path to " + filter + ", blacklisting presumably unreachable closest instance...", true);
+                }
+                locs.stream().min(Comparator.comparingDouble(ctx.playerFeet()::distSqr)).ifPresent(blacklist::add);
+                locs.removeIf(blacklist::contains);
+                knownOreLocations = locs;
+            } else {
+                logDirect("Unable to find any path to " + filter + ", canceling mine");
+                if (Baritone.settings().notificationOnMineFail.value) {
+                    logNotification("Unable to find any path to " + filter + ", canceling mine", true);
+                }
+                cancel();
+                return null;
             }
         }
         PathingCommand command = updateGoal(locs, context, Baritone.settings().legitMine.value);
@@ -258,18 +265,22 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         return filter.has(state) && plausibleToBreak(context, pos);
     }
 
-    private PathingCommand tryDirectMine(BlockPos pos, boolean isSafeToCancel) {
+    private DirectMineOpportunity directMineOpportunity(BlockPos pos) {
         BlockState state = baritone.bsi.get0(pos);
         if (MovementHelper.avoidBreaking(baritone.bsi, pos.getX(), pos.getY(), pos.getZ(), state)) {
             return null;
         }
         Optional<Rotation> rot = RotationUtils.reachable(ctx, pos);
-        if (rot.isEmpty() || !isSafeToCancel) {
+        if (rot.isEmpty()) {
             return null;
         }
-        baritone.getLookBehavior().updateTarget(rot.get(), true);
-        MovementHelper.switchToBestToolFor(ctx, ctx.world().getBlockState(pos));
-        if (ctx.isLookingAt(pos) || ctx.playerRotations().isReallyCloseTo(rot.get())) {
+        return new DirectMineOpportunity(pos, rot.get());
+    }
+
+    private PathingCommand startDirectMine(DirectMineOpportunity opportunity) {
+        baritone.getLookBehavior().updateTarget(opportunity.rotation, true);
+        MovementHelper.switchToBestToolFor(ctx, ctx.world().getBlockState(opportunity.pos));
+        if (ctx.isLookingAt(opportunity.pos) || ctx.playerRotations().isReallyCloseTo(opportunity.rotation)) {
             baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_LEFT, true);
         }
         return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
@@ -293,7 +304,7 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         boolean assumeVerticalShaftMine = !(baritone.bsi.get0(loc.above()).getBlock() instanceof FallingBlock);
         if (!Baritone.settings().forceInternalMining.value) {
             Goal goal = assumeVerticalShaftMine ? new GoalThreeBlocks(loc) : new GoalTwoBlocks(loc);
-            return new InternalMiningPlan(goal, goal, loc);
+            return new InternalMiningPlan(goal, loc);
         }
         boolean upwardGoal = internalMiningGoal(loc.above(), context, locs);
         boolean downwardGoal = internalMiningGoal(loc.below(), context, locs);
@@ -302,36 +313,36 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
             Goal symmetricGoal = doubleDownwardGoal && assumeVerticalShaftMine ? new GoalThreeBlocks(loc) : new GoalTwoBlocks(loc);
             if (upwardGoal && shouldPreferDownward(loc, context, locs)) {
                 Goal preferredGoal = doubleDownwardGoal && assumeVerticalShaftMine ? new GoalTwoBlocks(loc.below()) : new GoalBlock(loc.below());
-                return new InternalMiningPlan(new GoalInternalMiningBranch(preferredGoal, symmetricGoal), symmetricGoal, null);
+                return new InternalMiningPlan(new GoalInternalMiningBranch(symmetricGoal, preferredGoal), null);
             }
             if (doubleDownwardGoal && assumeVerticalShaftMine) {
                 // we have a checkerboard like pattern
                 // this one, and the one two below it
                 // therefore it's fine to path to immediately below this one, since your feet will be in the doubleDownwardGoal
                 // but only if assumeVerticalShaftMine
-                return new InternalMiningPlan(symmetricGoal, symmetricGoal, loc);
+                return new InternalMiningPlan(symmetricGoal, loc);
             } else {
                 // this block has nothing interesting two below, but is symmetric vertically so we can get either feet or head into it
-                return new InternalMiningPlan(symmetricGoal, symmetricGoal, loc);
+                return new InternalMiningPlan(symmetricGoal, loc);
             }
         }
         if (upwardGoal) {
             // downwardGoal known to be false
             // ignore the gap then potential doubleDownward, because we want to path feet into this one and head into upwardGoal
             Goal goal = new GoalBlock(loc);
-            return new InternalMiningPlan(goal, goal, loc);
+            return new InternalMiningPlan(goal, loc);
         }
         // upwardGoal known to be false, downwardGoal known to be true
         if (doubleDownwardGoal && assumeVerticalShaftMine) {
             // this block and two below it are goals
             // path into the center of the one below, because that includes directly below this one
             Goal goal = new GoalTwoBlocks(loc.below());
-            return new InternalMiningPlan(goal, goal, null);
+            return new InternalMiningPlan(goal, null);
         }
         // upwardGoal false, downwardGoal true, doubleDownwardGoal false
         // just this block and the one immediately below, no others
         Goal goal = new GoalBlock(loc.below());
-        return new InternalMiningPlan(goal, goal, null);
+        return new InternalMiningPlan(goal, null);
     }
 
     private static class GoalThreeBlocks extends GoalTwoBlocks {
@@ -547,7 +558,7 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
 
     @Override
     public void mine(int quantity, BlockOptionalMetaLookup filter) {
-        mine(quantity, filter, false);
+        mine(quantity, filter, Baritone.settings().mineScoopsDrops.value);
     }
 
     @Override
@@ -556,6 +567,10 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
     }
 
     private void mine(int quantity, BlockOptionalMetaLookup filter, boolean collectDrops) {
+        if (this.savedThrowawayItems != null) {
+            Baritone.settings().acceptableThrowawayItems.value = new ArrayList<>(this.savedThrowawayItems);
+            this.savedThrowawayItems = null;
+        }
         this.filter = filter;
         if (this.filterFilter() == null) {
             this.filter = null;
@@ -567,7 +582,14 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         this.branchPoint = null;
         this.branchPointRunaway = null;
         this.anticipatedDrops = new HashMap<>();
-        if (filter != null) {
+        if (this.filter != null) {
+            if (collectDrops) {
+                this.savedThrowawayItems = new ArrayList<>(Baritone.settings().acceptableThrowawayItems.value);
+                BlockOptionalMetaLookup f = this.filter;
+                Baritone.settings().acceptableThrowawayItems.value = this.savedThrowawayItems.stream()
+                        .filter(item -> !f.has(new ItemStack(item)))
+                        .collect(Collectors.toCollection(ArrayList::new));
+            }
             rescan(new ArrayList<>(), new CalculationContext(baritone));
         }
     }
@@ -575,12 +597,10 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
     private static final class InternalMiningPlan {
 
         private final Goal goal;
-        private final Goal heuristicGoal;
         private final BlockPos directMineTarget;
 
-        private InternalMiningPlan(Goal goal, Goal heuristicGoal, BlockPos directMineTarget) {
+        private InternalMiningPlan(Goal goal, BlockPos directMineTarget) {
             this.goal = goal;
-            this.heuristicGoal = heuristicGoal;
             this.directMineTarget = directMineTarget;
         }
 
@@ -589,29 +609,40 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         }
     }
 
+    private static final class DirectMineOpportunity {
+
+        private final BlockPos pos;
+        private final Rotation rotation;
+
+        private DirectMineOpportunity(BlockPos pos, Rotation rotation) {
+            this.pos = pos;
+            this.rotation = rotation;
+        }
+    }
+
     private static final class GoalInternalMiningBranch implements Goal, IGoalRenderPos {
 
+        private final Goal acceptableGoal;
         private final Goal preferredGoal;
-        private final Goal heuristicGoal;
 
-        private GoalInternalMiningBranch(Goal preferredGoal, Goal heuristicGoal) {
+        private GoalInternalMiningBranch(Goal acceptableGoal, Goal preferredGoal) {
+            this.acceptableGoal = acceptableGoal;
             this.preferredGoal = preferredGoal;
-            this.heuristicGoal = heuristicGoal;
         }
 
         @Override
         public boolean isInGoal(int x, int y, int z) {
-            return preferredGoal.isInGoal(x, y, z);
+            return acceptableGoal.isInGoal(x, y, z);
         }
 
         @Override
         public double heuristic(int x, int y, int z) {
-            return heuristicGoal.heuristic(x, y, z);
+            return preferredGoal.heuristic(x, y, z);
         }
 
         @Override
         public double heuristic() {
-            return heuristicGoal.heuristic();
+            return acceptableGoal.heuristic();
         }
 
         @Override
@@ -619,7 +650,7 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
             if (preferredGoal instanceof IGoalRenderPos renderGoal) {
                 return renderGoal.getGoalPos();
             }
-            if (heuristicGoal instanceof IGoalRenderPos renderGoal) {
+            if (acceptableGoal instanceof IGoalRenderPos renderGoal) {
                 return renderGoal.getGoalPos();
             }
             throw new IllegalStateException("Internal mining goal should have a render position");
@@ -634,17 +665,17 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
                 return false;
             }
             GoalInternalMiningBranch that = (GoalInternalMiningBranch) o;
-            return preferredGoal.equals(that.preferredGoal) && heuristicGoal.equals(that.heuristicGoal);
+            return acceptableGoal.equals(that.acceptableGoal) && preferredGoal.equals(that.preferredGoal);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(preferredGoal, heuristicGoal);
+            return Objects.hash(acceptableGoal, preferredGoal);
         }
 
         @Override
         public String toString() {
-            return "GoalInternalMiningBranch{preferred=" + preferredGoal + ", heuristic=" + heuristicGoal + "}";
+            return "GoalInternalMiningBranch{acceptable=" + acceptableGoal + ", preferred=" + preferredGoal + "}";
         }
     }
 

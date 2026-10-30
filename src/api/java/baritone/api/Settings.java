@@ -1016,6 +1016,16 @@ public final class Settings {
     public final Setting<Boolean> buildInLayers = new Setting<>(false);
 
     /**
+     * Allow #sel builds such as fill, replace, paste, and lightaura to restock from shulker boxes in your inventory.
+     */
+    public final Setting<Boolean> selSearchShulkers = new Setting<>(false);
+
+    /**
+     * Ticks to wait between selection shulker restock actions such as placing, opening, quick-moving, and breaking.
+     */
+    public final Setting<Integer> selShulkerSearchDelay = new Setting<>(6);
+
+    /**
      * false = build from bottom to top
      * <p>
      * true = build from top to bottom
@@ -1061,7 +1071,9 @@ public final class Settings {
     public final Setting<Boolean> buildRepeatSneaky = new Setting<>(true);
 
     /**
-     * Allow standing above a block while mining it, in BuilderProcess
+     * Allow standing above a block while mining it, in BuilderProcess and MineProcess.
+     * In MineProcess, when standing directly on a target block, this enables a direct-mine
+     * click so the block is broken from above (you fall into its position when it pops).
      * <p>
      * Experimental
      */
@@ -1092,7 +1104,7 @@ public final class Settings {
     /**
      * Multiply the cost of breaking a block that's correct in the builder's schematic by this coefficient
      */
-    public final Setting<Double> breakCorrectBlockPenaltyMultiplier = new Setting<>(10d);
+    public final Setting<Double> breakCorrectBlockPenaltyMultiplier = new Setting<>(100d);
 
     /**
      * Multiply the cost of placing a block that's incorrect in the builder's schematic by this coefficient
@@ -1152,6 +1164,13 @@ public final class Settings {
      * While mining, should it also consider dropped items of the correct type as a pathing destination (as well as ore blocks)?
      */
     public final Setting<Boolean> mineScanDroppedItems = new Setting<>(true);
+
+    /**
+     * If true, {@code #mine} prefers picking up matching dropped items before continuing to break more blocks,
+     * and removes the mined item from {@link #acceptableThrowawayItems} for the duration of the mine so it is not
+     * accidentally placed back. Equivalent to the old {@code #harvest} / {@code #minecollect} command.
+     */
+    public final Setting<Boolean> mineScoopsDrops = new Setting<>(false);
 
     /**
      * While mining, wait this number of milliseconds after mining an ore to see if it will drop an item
@@ -1358,7 +1377,7 @@ public final class Settings {
     @JavaOnly
     public final Setting<Consumer<Component>> logger = new Setting<>((msg) -> {
         try {
-            Minecraft.getInstance().gui.getChat().addClientSystemMessage(msg);
+            Minecraft.getInstance().player.sendSystemMessage(msg);
         } catch (Throwable t) {
             LOGGER.warn("Failed to log message to chat: " + msg.getString(), t);
         }
@@ -1563,6 +1582,16 @@ public final class Settings {
     public final Setting<Boolean> elytraRenderSimulation = new Setting<>(true);
 
     /**
+     * Render the currently chosen elytra control line in green.
+     */
+    public final Setting<Boolean> elytraGreenLine = new Setting<>(true);
+
+    /**
+     * Maximum number of elytra debug raytrace lines to render per color each tick. Set to 0 for unlimited.
+     */
+    public final Setting<Integer> elytraLines = new Setting<>(64);
+
+    /**
      * Automatically path to and jump off of ledges to initiate elytra flight when grounded.
      */
     public final Setting<Boolean> elytraAutoJump = new Setting<>(false);
@@ -1594,6 +1623,11 @@ public final class Settings {
      * approach instead of a dry touchdown.
      */
     public final Setting<Boolean> elytraOverworldWaterDive = new Setting<>(false);
+
+    /**
+     * After landing near the goal, continue walking until the original goal is reached.
+     */
+    public final Setting<Boolean> elytraWalkToGoalOnLanding = new Setting<>(true);
 
     /**
      * The seed used to generate chunks for long distance elytra path-finding in the nether.

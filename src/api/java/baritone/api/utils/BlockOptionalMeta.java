@@ -32,6 +32,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.RegistryLayer;
 import net.minecraft.server.ReloadableServerRegistries;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.packs.PackResources;
 import net.minecraft.server.packs.PackType;
 import net.minecraft.server.packs.VanillaPackResources;
 import net.minecraft.server.packs.repository.ServerPacksSource;
@@ -302,22 +303,22 @@ public final class BlockOptionalMeta {
             // Simplified from {@link net.minecraft.server.WorldLoader#load()}
             CloseableResourceManager closeableResourceManager = new MultiPackResourceManager(
                 PackType.SERVER_DATA,
-                List.of(ServerPacksSource.createVanillaPackSource())
+                List.<PackResources>of(ServerPacksSource.createVanillaPackSource().fullResources())
             );
             LayeredRegistryAccess<RegistryLayer> baseLayeredRegistry = RegistryLayer.createRegistryAccess();
             List<Registry.PendingTags<?>> pendingTags = TagLoader.loadTagsForExistingRegistries(
                 closeableResourceManager, baseLayeredRegistry.getLayer(RegistryLayer.STATIC)
             );
             List<HolderLookup.RegistryLookup<?>> worldGenRegistryLookupList = TagLoader.buildUpdatedLookups(
-                baseLayeredRegistry.getAccessForLoading(RegistryLayer.WORLDGEN),
+                baseLayeredRegistry.getAccessForLoading(RegistryLayer.WORLD),
                 pendingTags
             );
             LayeredRegistryAccess<RegistryLayer> layeredRegistryAccess = baseLayeredRegistry.replaceFrom(
-                RegistryLayer.WORLDGEN,
+                RegistryLayer.WORLD,
                 RegistryDataLoader.load(
                     closeableResourceManager,
                     worldGenRegistryLookupList,
-                    RegistryDataLoader.WORLDGEN_REGISTRIES,
+                    RegistryDataLoader.WORLD_REGISTRIES,
                     ForkJoinPool.commonPool()
                 ).join()
             );

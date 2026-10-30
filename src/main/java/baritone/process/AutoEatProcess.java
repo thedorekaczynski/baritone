@@ -37,25 +37,31 @@ public final class AutoEatProcess extends BaritoneProcessHelper {
 
     @Override
     public boolean isActive() {
-        if (!Baritone.settings().autoEat.value || ctx.player() == null || ctx.world() == null) {
+        if (ctx.player() == null || ctx.world() == null) {
             return false;
         }
-        if (!isBaritoneBusy()) {
+        if (shouldRestorePreviousSlot()) {
+            return true;
+        }
+        if (!Baritone.settings().autoEat.value) {
             return false;
         }
-        if (ctx.player().isUsingItem()) {
-            return isHoldingHotbarFood();
+        if (isEatingFromActiveFoodSlot()) {
+            return true;
         }
-        FoodData food = ctx.player().getFoodData();
-        return food.getFoodLevel() <= Baritone.settings().autoEatHungerThreshold.value && findHotbarFoodSlot() != -1;
+        return shouldStartEating();
     }
 
     @Override
     public PathingCommand onTick(boolean calcFailed, boolean isSafeToCancel) {
         baritone.getInputOverrideHandler().clearAllKeys();
-        if (ctx.player().isUsingItem()) {
+        if (isEatingFromActiveFoodSlot()) {
             baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_RIGHT, true);
             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+        if (!Baritone.settings().autoEat.value || !shouldStartEating()) {
+            restorePreviousSlot();
+            return new PathingCommand(null, PathingCommandType.DEFER);
         }
         if (!isSafeToCancel) {
             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
@@ -113,8 +119,23 @@ public final class AutoEatProcess extends BaritoneProcessHelper {
         return selected >= 0 && selected < 9 && isUsableFood(ctx.player().getInventory().getItem(selected));
     }
 
+    private boolean isEatingFromActiveFoodSlot() {
+        return activeFoodSlot != -1
+                && ctx.player().isUsingItem()
+                && ctx.player().getInventory().getSelectedSlot() == activeFoodSlot
+                && isHoldingHotbarFood();
+    }
+
     private boolean isUsableFood(ItemStack stack) {
         return !stack.isEmpty() && stack.getItem().components().has(DataComponents.FOOD);
+    }
+
+    private boolean shouldStartEating() {
+        if (!isBaritoneBusy()) {
+            return false;
+        }
+        FoodData food = ctx.player().getFoodData();
+        return food.getFoodLevel() <= Baritone.settings().autoEatHungerThreshold.value && findHotbarFoodSlot() != -1;
     }
 
     private boolean isBaritoneBusy() {
@@ -122,8 +143,20 @@ public final class AutoEatProcess extends BaritoneProcessHelper {
                 || baritone.getPathingBehavior().getInProgress().isPresent();
     }
 
+    private boolean shouldRestorePreviousSlot() {
+        return previousHotbarSlot != -1;
+    }
+
     private void restorePreviousSlot() {
-        if (previousHotbarSlot != -1 && ctx.player() != null) {
+        if (ctx.player() == null) {
+            previousHotbarSlot = -1;
+            activeFoodSlot = -1;
+            return;
+        }
+        int selectedSlot = ctx.player().getInventory().getSelectedSlot();
+        if (activeFoodSlot != -1
+                && selectedSlot == activeFoodSlot
+                && previousHotbarSlot != activeFoodSlot) {
             ctx.player().getInventory().setSelectedSlot(previousHotbarSlot);
             ctx.playerController().syncHeldItem();
         }

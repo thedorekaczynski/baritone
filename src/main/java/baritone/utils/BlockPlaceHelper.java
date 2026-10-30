@@ -20,6 +20,7 @@ package baritone.utils;
 import baritone.Baritone;
 import baritone.api.utils.IPlayerContext;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
@@ -35,7 +36,7 @@ public class BlockPlaceHelper {
         this.ctx = playerContext;
     }
 
-    public void tick(boolean rightClickRequested) {
+    public void tick(boolean rightClickRequested, boolean forceSecondaryUse) {
         if (rightClickTimer > 0) {
             rightClickTimer--;
             return;
@@ -45,13 +46,26 @@ public class BlockPlaceHelper {
             return;
         }
         rightClickTimer = Baritone.settings().rightClickSpeed.value - BASE_PLACE_DELAY;
-        for (InteractionHand hand : InteractionHand.values()) {
-            if (ctx.playerController().processRightClickBlock(ctx.player(), ctx.world(), hand, (BlockHitResult) mouseOver) == InteractionResult.SUCCESS) {
-                ctx.player().swing(hand);
-                return;
+        boolean previousShiftState = ctx.player().isShiftKeyDown();
+        // forcing shift in water makes the player swim down instead of anchoring — skip it
+        boolean shouldForceShift = forceSecondaryUse && !previousShiftState && !ctx.player().isInWater();
+        if (shouldForceShift) {
+            ctx.player().setShiftKeyDown(true);
+        }
+        try {
+            for (InteractionHand hand : InteractionHand.values()) {
+                InteractionResult blockResult = ctx.playerController().processRightClickBlock(ctx.player(), ctx.world(), hand, (BlockHitResult) mouseOver);
+                if (blockResult.consumesAction()) {
+                    ctx.player().swing(hand, SwingAnimation.DEFAULT, false);
+                    return;
+                }
+                if (!ctx.player().getItemInHand(hand).isEmpty() && ctx.playerController().processRightClick(ctx.player(), ctx.world(), hand).consumesAction()) {
+                    return;
+                }
             }
-            if (!ctx.player().getItemInHand(hand).isEmpty() && ctx.playerController().processRightClick(ctx.player(), ctx.world(), hand) == InteractionResult.SUCCESS) {
-                return;
+        } finally {
+            if (shouldForceShift) {
+                ctx.player().setShiftKeyDown(false);
             }
         }
     }

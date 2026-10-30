@@ -20,15 +20,13 @@ package baritone.launch.mixins;
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 import baritone.api.event.events.RenderEvent;
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
 import com.mojang.blaze3d.vertex.PoseStack;
-import net.minecraft.client.DeltaTracker;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.LevelRenderer;
-import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import org.joml.Matrix4f;
-import org.joml.Matrix4fc;
 import org.joml.Vector4f;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -42,15 +40,20 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(LevelRenderer.class)
 public class MixinWorldRenderer {
 
+    // 26.3: LevelRenderer.render no longer takes a DeltaTracker or the view matrix
+    // directly. The matrix now lives on CameraRenderState, and the partial tick comes
+    // from the client's own DeltaTracker.
     @Inject(
-            method = "renderLevel",
+            method = "render",
             at = @At("RETURN")
     )
-    private void onStartHand(final GraphicsResourceAllocator graphicsResourceAllocator, final DeltaTracker deltaTracker, final boolean bl, final CameraRenderState cameraRenderState, final Matrix4fc matrix4f, final GpuBufferSlice gpuBufferSlice, final Vector4f vector4f, final boolean bl2, final ChunkSectionsToRender chunkSectionsToRender, final CallbackInfo ci) {
+    private void onStartHand(final GraphicsResourceAllocator graphicsResourceAllocator, final boolean bl, final CameraRenderState cameraRenderState, final GpuBufferSlice gpuBufferSlice, final Vector4f vector4f, final boolean bl2, final boolean bl3, final CallbackInfo ci) {
+        final Matrix4f viewMatrix = cameraRenderState.viewRotationMatrix;
+        final float partialTick = Minecraft.getInstance().getDeltaTracker().getGameTimeDeltaPartialTick(false);
         for (IBaritone ibaritone : BaritoneAPI.getProvider().getAllBaritones()) {
             PoseStack poseStack = new PoseStack();
-            poseStack.mulPose(matrix4f);
-            ibaritone.getGameEventHandler().onRenderPass(new RenderEvent(deltaTracker.getGameTimeDeltaPartialTick(false), poseStack, new Matrix4f(matrix4f)));
+            poseStack.mulPose(viewMatrix);
+            ibaritone.getGameEventHandler().onRenderPass(new RenderEvent(partialTick, poseStack, new Matrix4f(viewMatrix)));
         }
     }
 }

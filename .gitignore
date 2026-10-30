@@ -36,6 +36,7 @@ baritone_Client.launch
 
 .vscode/launch.json
 .architectury-transformer
+build-and-copy.bat
 
 
 mapping

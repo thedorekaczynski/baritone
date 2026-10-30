@@ -128,7 +128,6 @@ public final class CachedRegion implements ICachedRegion {
                 Files.createDirectories(path);
 
             }
-            System.out.println("Saving region " + x + "," + z + " to disk " + path);
             Path regionFile = getRegionFile(path, this.x, this.z);
             if (!Files.exists(regionFile)) {
                 Files.createFile(regionFile);
@@ -187,7 +186,6 @@ public final class CachedRegion implements ICachedRegion {
                 }
             }
             hasUnsavedChanges = false;
-            System.out.println("Saved region successfully");
         } catch (Exception ex) {
             ex.printStackTrace();
         }
@@ -204,9 +202,6 @@ public final class CachedRegion implements ICachedRegion {
             if (!Files.exists(regionFile)) {
                 return;
             }
-
-            System.out.println("Loading region " + x + "," + z + " from disk " + path);
-            long start = System.nanoTime() / 1000000L;
 
             try (
                     FileInputStream fileIn = new FileInputStream(regionFile.toFile());
@@ -305,8 +300,6 @@ public final class CachedRegion implements ICachedRegion {
             }
             removeExpired();
             hasUnsavedChanges = false;
-            long end = System.nanoTime() / 1000000L;
-            System.out.println("Loaded region successfully in " + (end - start) + "ms");
         } catch (Exception ex) { // corrupted files can cause NullPointerExceptions as well as IOExceptions
             ex.printStackTrace();
         }

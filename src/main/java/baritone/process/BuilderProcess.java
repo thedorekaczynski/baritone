@@ -22,6 +22,7 @@ import baritone.api.pathing.goals.Goal;
 import baritone.api.pathing.goals.GoalBlock;
 import baritone.api.pathing.goals.GoalComposite;
 import baritone.api.pathing.goals.GoalGetToBlock;
+import baritone.api.pathing.goals.GoalNear;
 import baritone.api.process.IBuilderProcess;
 import baritone.api.process.PathingCommand;
 import baritone.api.process.PathingCommandType;
@@ -45,11 +46,16 @@ import com.google.common.collect.ImmutableSet;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.NonNullList;
 import net.minecraft.core.Vec3i;
-import net.minecraft.util.Tuple;
+import net.minecraft.core.component.DataComponents;
+import baritone.api.utils.Tuple;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.component.ItemContainerContents;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.item.context.UseOnContext;
 import net.minecraft.world.level.block.*;
@@ -74,6 +80,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     private static final Set<Property<?>> ORIENTATION_PROPS =
             ImmutableSet.of(
                     RotatedPillarBlock.AXIS, HorizontalDirectionalBlock.FACING,
+                    HopperBlock.FACING,
                     StairBlock.FACING, StairBlock.HALF, StairBlock.SHAPE,
                     PipeBlock.NORTH, PipeBlock.EAST, PipeBlock.SOUTH, PipeBlock.WEST, PipeBlock.UP,
                     TrapDoorBlock.OPEN, TrapDoorBlock.HALF
@@ -91,9 +98,42 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     private int numRepeats;
     private List<BlockState> approxPlaceable;
     public int stopAtHeight = 0;
+    private boolean searchShulkers;
+    private boolean ignoreBlockedPositions;
+
+    // Shulker restock state machine
+    private enum ShulkerRestockState {
+        NONE,
+        SELECT_SHULKER,    // select the shulker box on hotbar
+        PLACE_SHULKER,     // place it down
+        WAIT_PLACED,       // wait for the block to appear
+        OPEN_SHULKER,      // right-click to open
+        WAIT_OPEN,         // wait for container GUI
+        TAKE_ITEMS,        // quick-move needed items
+        CLOSE_SHULKER,     // close the container
+        WAIT_CLOSE,        // wait for container to close
+        BREAK_SHULKER,     // mine the shulker back
+        COLLECT_SHULKER    // wait for item entity pickup
+    }
+    private ShulkerRestockState shulkerRestockState = ShulkerRestockState.NONE;
+    private BlockPos placedShulkerPos;
+    private int shulkerRestockTicks;
+    private Block neededBlock; // the block we're restocking for
 
     public BuilderProcess(Baritone baritone) {
         super(baritone);
+    }
+
+    /**
+     * Build a selection schematic with extra selection-specific options.
+     *
+     * @param searchShulkers         search shulker box inventories for materials
+     * @param ignoreBlockedPositions skip positions that contain protected/unbreakable blocks
+     */
+    public void buildSelection(String name, ISchematic schematic, Vec3i origin, boolean searchShulkers, boolean ignoreBlockedPositions) {
+        this.searchShulkers = searchShulkers;
+        this.ignoreBlockedPositions = ignoreBlockedPositions;
+        build(name, schematic, origin);
     }
 
     @Override
@@ -101,6 +141,8 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         this.name = name;
         this.schematic = schematic;
         this.realSchematic = null;
+        this.searchShulkers = false;
+        this.ignoreBlockedPositions = false;
         boolean buildingSelectionSchematic = schematic instanceof SelectionSchematic;
         if (!Baritone.settings().buildSubstitutes.value.isEmpty()) {
             this.schematic = new SubstituteSchematic(this.schematic, Baritone.settings().buildSubstitutes.value);
@@ -331,6 +373,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                         if (dy == 1 && bcc.bsi.get0(x, y + 1, z).getBlock() instanceof AirBlock) {
                             continue;
                         }
+                        if (!dependenciesMet(bcc, x, y, z, desired)) {
+                            continue;
+                        }
                         desirableOnHotbar.add(desired);
                         Optional<Placement> opt = possibleToPlace(desired, x, y, z, bcc.bsi);
                         if (opt.isPresent()) {
@@ -341,6 +386,19 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             }
         }
         return Optional.empty();
+    }
+
+    private boolean dependenciesMet(BuilderCalculationContext bcc, int x, int y, int z, BlockState desired) {
+        if (!(desired.getBlock() instanceof HopperBlock)) {
+            return true;
+        }
+        Direction facing = desired.getValue(HopperBlock.FACING);
+        if (facing == Direction.DOWN) {
+            return true;
+        }
+        // Hopper faces horizontally — check if target block exists (any solid block, not just schematic match)
+        BlockState target = bcc.bsi.get0(x + facing.getStepX(), y + facing.getStepY(), z + facing.getStepZ());
+        return !(target.getBlock() instanceof AirBlock);
     }
 
     public boolean placementPlausible(BlockPos pos, BlockState state) {
@@ -455,6 +513,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         if (paused) {
             return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         }
+        // Handle shulker restock state machine
+        if (shulkerRestockState != ShulkerRestockState.NONE) {
+            return handleShulkerRestock();
+        }
         if (Baritone.settings().buildInLayers.value) {
             if (realSchematic == null) {
                 realSchematic = schematic;
@@ -523,7 +585,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             }
             // build repeat time
             layer = 0;
-            origin = new BlockPos(origin).offset(repeat);
+            origin = origin.offset(repeat);
             if (!Baritone.settings().buildRepeatSneaky.value) {
                 schematic.reset();
             }
@@ -604,9 +666,22 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     layer++;
                     return onTick(calcFailed, isSafeToCancel, recursions + 1);
                 }
-                logDirect("Unable to do it. Pausing. resume to resume, cancel to cancel");
+                logDirect("Missing materials, pausing. resume to resume, cancel to cancel");
                 paused = true;
                 return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+        }
+        // If materials are only in shulkers (not in direct inventory), restock before placement
+        if (searchShulkers) {
+            Block missing = findBlockOnlyInShulkers(bcc);
+            if (missing != null) {
+                int shulkerSlot = findShulkerContaining(missing);
+                if (shulkerSlot != -1) {
+                    logDirect("Restocking " + BlockUtils.blockToString(missing) + " from shulker box");
+                    neededBlock = missing;
+                    beginShulkerRestock(shulkerSlot);
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
             }
         }
         return new PathingCommandContext(goal, PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH, bcc);
@@ -716,6 +791,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
 
     private Goal assemble(BuilderCalculationContext bcc, List<BlockState> approxPlaceable, boolean logMissing) {
         List<BetterBlockPos> placeable = new ArrayList<>();
+        List<BetterBlockPos> deferredPlaceable = new ArrayList<>();
         List<BetterBlockPos> breakable = new ArrayList<>();
         List<BetterBlockPos> sourceLiquids = new ArrayList<>();
         List<BetterBlockPos> flowingLiquids = new ArrayList<>();
@@ -728,7 +804,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 outOfBounds.add(pos);
             } else if (state.getBlock() instanceof AirBlock) {
                 if (containsBlockState(approxPlaceable, desired)) {
-                    placeable.add(pos);
+                    if (dependenciesMet(bcc, pos.x, pos.y, pos.z, desired)) {
+                        placeable.add(pos);
+                    } else {
+                        deferredPlaceable.add(pos);
+                    }
                 } else {
                     missingBlocks.add(desired.getBlock());
                 }
@@ -736,7 +816,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 if (state.getBlock() instanceof LiquidBlock) {
                     if (!(desired.getBlock() instanceof AirBlock)) {
                         if (containsBlockState(approxPlaceable, desired)) {
-                            placeable.add(pos);
+                            if (dependenciesMet(bcc, pos.x, pos.y, pos.z, desired)) {
+                                placeable.add(pos);
+                            } else {
+                                deferredPlaceable.add(pos);
+                            }
                         } else {
                             missingBlocks.add(desired.getBlock());
                         }
@@ -756,6 +840,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             }
         });
         incorrectPositions.removeAll(outOfBounds);
+        // Deadlock breaker: if nothing to place/break/drain, promote deferred hoppers
+        if (placeable.isEmpty() && breakable.isEmpty() && sourceLiquids.isEmpty() && !deferredPlaceable.isEmpty()) {
+            placeable.addAll(deferredPlaceable);
+        }
         List<Goal> toBreak = new ArrayList<>();
         breakable.forEach(pos -> toBreak.add(breakGoal(pos, bcc)));
         List<Goal> toPlace = new ArrayList<>();
@@ -771,11 +859,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
         if (toBreak.isEmpty()) {
             if (logMissing && !missingBlocks.isEmpty()) {
-                logDirect("Missing required materials. Counts omitted because selection estimates are unreliable.");
-                logDirect(missingBlocks.stream()
+                logDirect("Missing: " + missingBlocks.stream()
                         .map(BlockUtils::blockToString)
                         .sorted(String.CASE_INSENSITIVE_ORDER)
-                        .collect(Collectors.joining("\n")));
+                        .collect(Collectors.joining(", ")));
             }
             if (logMissing && !flowingLiquids.isEmpty()) {
                 logDirect("Unreplaceable liquids at at least:");
@@ -1002,6 +1089,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         numRepeats = 0;
         paused = false;
         observedCompleted = null;
+        shulkerRestockState = ShulkerRestockState.NONE;
+        placedShulkerPos = null;
+        shulkerRestockTicks = 0;
+        neededBlock = null;
     }
 
     @Override
@@ -1048,7 +1139,418 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             }
             // </toxic cloud>
         }
+        // When shulker searching is enabled, also include items found inside shulker boxes
+        if (searchShulkers) {
+            for (BlockState bs : getShulkerContentsAsPlaceable()) {
+                if (!containsBlockState(result, bs)) {
+                    result.add(bs);
+                }
+            }
+        }
         return result;
+    }
+
+    /**
+     * Scan all shulker boxes in the player's inventory and return the BlockStates of
+     * any block items found inside them.
+     */
+    private List<BlockState> getShulkerContentsAsPlaceable() {
+        List<BlockState> result = new ArrayList<>();
+        NonNullList<ItemStack> inv = ctx.player().getInventory().getNonEquipmentItems();
+        for (int i = 0; i < inv.size(); i++) {
+            ItemStack stack = inv.get(i);
+            if (stack.isEmpty() || !(stack.getItem() instanceof BlockItem)) {
+                continue;
+            }
+            if (!(((BlockItem) stack.getItem()).getBlock() instanceof ShulkerBoxBlock)) {
+                continue;
+            }
+            ItemContainerContents contents = stack.get(DataComponents.CONTAINER);
+            if (contents == null) {
+                continue;
+            }
+            contents.nonEmptyItemCopyStream().forEach(inner -> {
+                if (inner.getItem() instanceof BlockItem) {
+                    BlockState state = ((BlockItem) inner.getItem()).getBlock().defaultBlockState();
+                    result.add(state);
+                }
+            });
+        }
+        return result;
+    }
+
+    /**
+     * Find the inventory slot of a shulker box that contains the given block.
+     * Returns -1 if not found.
+     */
+    private int findShulkerContaining(Block block) {
+        NonNullList<ItemStack> inv = ctx.player().getInventory().getNonEquipmentItems();
+        for (int i = 0; i < inv.size(); i++) {
+            ItemStack stack = inv.get(i);
+            if (stack.isEmpty() || !(stack.getItem() instanceof BlockItem)) {
+                continue;
+            }
+            if (!(((BlockItem) stack.getItem()).getBlock() instanceof ShulkerBoxBlock)) {
+                continue;
+            }
+            ItemContainerContents contents = stack.get(DataComponents.CONTAINER);
+            if (contents == null) {
+                continue;
+            }
+            boolean[] found = {false};
+            contents.nonEmptyItemCopyStream().forEach(inner -> {
+                if (inner.getItem() instanceof BlockItem && ((BlockItem) inner.getItem()).getBlock() == block) {
+                    found[0] = true;
+                }
+            });
+            if (found[0]) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Check if a block is available directly in the player's inventory (not inside shulkers).
+     */
+    private boolean hasBlockInDirectInventory(Block block) {
+        NonNullList<ItemStack> inv = ctx.player().getInventory().getNonEquipmentItems();
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inv.get(i);
+            if (!stack.isEmpty() && stack.getItem() instanceof BlockItem && ((BlockItem) stack.getItem()).getBlock() == block) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Find a block needed for the build that exists in a shulker but not in direct inventory.
+     * Called when we have a goal (some things can be placed) but others need restock.
+     */
+    private Block findBlockOnlyInShulkers(BuilderCalculationContext bcc) {
+        if (incorrectPositions == null) return null;
+        BetterBlockPos center = ctx.playerFeet();
+        // Only check nearby positions — no need to restock for far-away blocks
+        for (BetterBlockPos pos : incorrectPositions) {
+            if (pos.distSqr(center) > 100) continue; // within ~10 blocks
+            BlockState current = bcc.bsi.get0(pos);
+            BlockState desired = bcc.getSchematic(pos.x, pos.y, pos.z, current);
+            if (desired == null) continue;
+            if ((current.getBlock() instanceof AirBlock || current.getBlock() instanceof LiquidBlock) && !(desired.getBlock() instanceof AirBlock)) {
+                Block block = desired.getBlock();
+                if (!hasBlockInDirectInventory(block) && findShulkerContaining(block) != -1) {
+                    return block;
+                }
+            }
+        }
+        return null;
+    }
+
+    private int countEmptyInventorySlots() {
+        NonNullList<ItemStack> inv = ctx.player().getInventory().getNonEquipmentItems();
+        int count = 0;
+        for (int i = 0; i < 36; i++) {
+            if (inv.get(i).isEmpty()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private BlockPos findDroppedShulkerNear(BlockPos near) {
+        if (near == null) {
+            return null;
+        }
+        double bestDistSq = Double.MAX_VALUE;
+        BlockPos bestPos = null;
+        for (net.minecraft.world.entity.Entity entity : ((net.minecraft.client.multiplayer.ClientLevel) ctx.world()).entitiesForRendering()) {
+            if (entity instanceof net.minecraft.world.entity.item.ItemEntity itemEntity) {
+                ItemStack stack = itemEntity.getItem();
+                if (!stack.isEmpty() && stack.getItem() instanceof BlockItem
+                        && ((BlockItem) stack.getItem()).getBlock() instanceof ShulkerBoxBlock) {
+                    double distSq = entity.blockPosition().distSqr(near);
+                    if (distSq < 25 && distSq < bestDistSq) { // within 5 blocks of placement
+                        bestDistSq = distSq;
+                        bestPos = entity.blockPosition();
+                    }
+                }
+            }
+        }
+        return bestPos;
+    }
+
+    private void beginShulkerRestock(int shulkerSlot) {
+        // Move shulker to hotbar if needed
+        if (shulkerSlot >= 9) {
+            // It's in main inventory, need to swap to hotbar first
+            baritone.getInventoryBehavior().attemptToPutOnHotbar(shulkerSlot, i -> false);
+        }
+        shulkerRestockState = ShulkerRestockState.SELECT_SHULKER;
+        shulkerRestockTicks = 0;
+        placedShulkerPos = null;
+    }
+
+    private PathingCommand handleShulkerRestock() {
+        int delay = Baritone.settings().selShulkerSearchDelay.value;
+        shulkerRestockTicks++;
+
+        switch (shulkerRestockState) {
+            case SELECT_SHULKER: {
+                // Find the shulker on hotbar
+                NonNullList<ItemStack> inv = ctx.player().getInventory().getNonEquipmentItems();
+                int hotbarSlot = -1;
+                for (int i = 0; i < 9; i++) {
+                    ItemStack stack = inv.get(i);
+                    if (!stack.isEmpty() && stack.getItem() instanceof BlockItem
+                            && ((BlockItem) stack.getItem()).getBlock() instanceof ShulkerBoxBlock) {
+                        ItemContainerContents contents = stack.get(DataComponents.CONTAINER);
+                        if (contents != null) {
+                            boolean[] has = {false};
+                            contents.nonEmptyItemCopyStream().forEach(inner -> {
+                                if (inner.getItem() instanceof BlockItem && ((BlockItem) inner.getItem()).getBlock() == neededBlock) {
+                                    has[0] = true;
+                                }
+                            });
+                            if (has[0]) {
+                                hotbarSlot = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (hotbarSlot == -1) {
+                    // Shulker not on hotbar yet, check main inventory and swap
+                    int mainSlot = findShulkerContaining(neededBlock);
+                    if (mainSlot == -1) {
+                        logDirect("Shulker restock failed: no shulker with " + BlockUtils.blockToString(neededBlock));
+                        shulkerRestockState = ShulkerRestockState.NONE;
+                        return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                    }
+                    if (mainSlot >= 9) {
+                        baritone.getInventoryBehavior().attemptToPutOnHotbar(mainSlot, i -> false);
+                        return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                    }
+                    hotbarSlot = mainSlot;
+                }
+                ctx.player().getInventory().setSelectedSlot(hotbarSlot);
+                shulkerRestockState = ShulkerRestockState.PLACE_SHULKER;
+                shulkerRestockTicks = 0;
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+            case PLACE_SHULKER: {
+                if (shulkerRestockTicks < delay) {
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                // Find a spot to place the shulker: on top of a solid block near the player
+                BlockPos feet = ctx.playerFeet();
+                BlockPos placePos = null;
+                for (int dx = -2; dx <= 2; dx++) {
+                    for (int dz = -2; dz <= 2; dz++) {
+                        for (int dy = -1; dy <= 1; dy++) {
+                            BlockPos candidate = feet.offset(dx, dy, dz);
+                            if (candidate.equals(feet) || candidate.equals(feet.above())) continue;
+                            BlockState stateAt = ctx.world().getBlockState(candidate);
+                            BlockState stateBelow = ctx.world().getBlockState(candidate.below());
+                            if (stateAt.getBlock() instanceof AirBlock && !(stateBelow.getBlock() instanceof AirBlock) && !(stateBelow.getBlock() instanceof LiquidBlock)) {
+                                placePos = candidate;
+                                break;
+                            }
+                        }
+                        if (placePos != null) break;
+                    }
+                    if (placePos != null) break;
+                }
+                if (placePos == null) {
+                    logDirect("Shulker restock failed: no valid placement spot nearby");
+                    shulkerRestockState = ShulkerRestockState.NONE;
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                placedShulkerPos = placePos;
+                // Look at the block below the placement pos and right-click to place
+                BlockPos placeAgainst = placePos.below();
+                Optional<Rotation> rot = RotationUtils.reachable(ctx, placeAgainst, ctx.playerController().getBlockReachDistance());
+                if (rot.isPresent()) {
+                    baritone.getLookBehavior().updateTarget(rot.get(), true);
+                    if (ctx.isLookingAt(placeAgainst) || ctx.playerRotations().isReallyCloseTo(rot.get())) {
+                        baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_RIGHT, true);
+                        shulkerRestockState = ShulkerRestockState.WAIT_PLACED;
+                        shulkerRestockTicks = 0;
+                    }
+                } else {
+                    logDirect("Shulker restock failed: can't reach placement spot");
+                    shulkerRestockState = ShulkerRestockState.NONE;
+                }
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+            case WAIT_PLACED: {
+                if (shulkerRestockTicks < delay) {
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                if (placedShulkerPos != null && ctx.world().getBlockState(placedShulkerPos).getBlock() instanceof ShulkerBoxBlock) {
+                    shulkerRestockState = ShulkerRestockState.OPEN_SHULKER;
+                    shulkerRestockTicks = 0;
+                } else if (shulkerRestockTicks > 40) {
+                    logDirect("Shulker restock failed: shulker didn't place");
+                    shulkerRestockState = ShulkerRestockState.NONE;
+                }
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+            case OPEN_SHULKER: {
+                if (shulkerRestockTicks < delay) {
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                // Right-click the placed shulker to open it
+                Optional<Rotation> rot = RotationUtils.reachable(ctx, placedShulkerPos, ctx.playerController().getBlockReachDistance());
+                if (rot.isPresent()) {
+                    baritone.getLookBehavior().updateTarget(rot.get(), true);
+                    if (ctx.isLookingAt(placedShulkerPos) || ctx.playerRotations().isReallyCloseTo(rot.get())) {
+                        // Make sure we have an empty hand or at least not a block
+                        baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_RIGHT, true);
+                        shulkerRestockState = ShulkerRestockState.WAIT_OPEN;
+                        shulkerRestockTicks = 0;
+                    }
+                } else {
+                    logDirect("Shulker restock failed: can't reach shulker to open");
+                    shulkerRestockState = ShulkerRestockState.BREAK_SHULKER;
+                    shulkerRestockTicks = 0;
+                }
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+            case WAIT_OPEN: {
+                if (ctx.player().containerMenu != ctx.player().inventoryMenu) {
+                    // Container is open
+                    shulkerRestockState = ShulkerRestockState.TAKE_ITEMS;
+                    shulkerRestockTicks = 0;
+                } else if (shulkerRestockTicks > 40) {
+                    logDirect("Shulker restock failed: container didn't open");
+                    shulkerRestockState = ShulkerRestockState.BREAK_SHULKER;
+                    shulkerRestockTicks = 0;
+                }
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+            case TAKE_ITEMS: {
+                if (shulkerRestockTicks < delay) {
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                if (ctx.player().containerMenu == ctx.player().inventoryMenu) {
+                    // Container closed unexpectedly
+                    shulkerRestockState = ShulkerRestockState.BREAK_SHULKER;
+                    shulkerRestockTicks = 0;
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                // Count empty inventory slots; reserve 1 for the shulker box drop after mining
+                int emptySlots = countEmptyInventorySlots();
+                if (emptySlots <= 1) {
+                    logDirect("Shulker restock: inventory too full, skipping item transfer to reserve slot for shulker drop");
+                    shulkerRestockState = ShulkerRestockState.CLOSE_SHULKER;
+                    shulkerRestockTicks = 0;
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                int slotsAvailable = emptySlots - 1; // reserve 1 for the shulker box itself
+                // Quick-move (shift-click) matching items from the shulker (slots 0-26) to inventory
+                int containerId = ctx.player().containerMenu.containerId;
+                boolean movedAny = false;
+                for (int slot = 0; slot < 27 && slotsAvailable > 0; slot++) {
+                    ItemStack slotStack = ctx.player().containerMenu.getSlot(slot).getItem();
+                    if (!slotStack.isEmpty() && slotStack.getItem() instanceof BlockItem
+                            && ((BlockItem) slotStack.getItem()).getBlock() == neededBlock) {
+                        ctx.playerController().windowClick(containerId, slot, 0, ContainerInput.QUICK_MOVE, ctx.player());
+                        movedAny = true;
+                        slotsAvailable--;
+                    }
+                }
+                if (!movedAny) {
+                    logDirect("Shulker restock: no matching items found in shulker container");
+                }
+                shulkerRestockState = ShulkerRestockState.CLOSE_SHULKER;
+                shulkerRestockTicks = 0;
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+            case CLOSE_SHULKER: {
+                if (shulkerRestockTicks < delay) {
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                // Close the container
+                ctx.player().closeContainer();
+                shulkerRestockState = ShulkerRestockState.WAIT_CLOSE;
+                shulkerRestockTicks = 0;
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+            case WAIT_CLOSE: {
+                if (ctx.player().containerMenu == ctx.player().inventoryMenu) {
+                    shulkerRestockState = ShulkerRestockState.BREAK_SHULKER;
+                    shulkerRestockTicks = 0;
+                } else if (shulkerRestockTicks > 20) {
+                    ctx.player().closeContainer();
+                    shulkerRestockState = ShulkerRestockState.BREAK_SHULKER;
+                    shulkerRestockTicks = 0;
+                }
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+            case BREAK_SHULKER: {
+                if (shulkerRestockTicks < delay) {
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                if (placedShulkerPos == null) {
+                    shulkerRestockState = ShulkerRestockState.NONE;
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                if (!(ctx.world().getBlockState(placedShulkerPos).getBlock() instanceof ShulkerBoxBlock)) {
+                    // Already broken — go collect the drop
+                    shulkerRestockState = ShulkerRestockState.COLLECT_SHULKER;
+                    shulkerRestockTicks = 0;
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                if (shulkerRestockTicks > 200) {
+                    logDirect("Shulker restock failed: timed out breaking shulker");
+                    shulkerRestockState = ShulkerRestockState.NONE;
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                Optional<Rotation> rot = RotationUtils.reachable(ctx, placedShulkerPos, ctx.playerController().getBlockReachDistance());
+                if (rot.isPresent()) {
+                    baritone.getLookBehavior().updateTarget(rot.get(), true);
+                    MovementHelper.switchToBestToolFor(ctx, ctx.world().getBlockState(placedShulkerPos));
+                    if (ctx.isLookingAt(placedShulkerPos) || ctx.playerRotations().isReallyCloseTo(rot.get())) {
+                        baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_LEFT, true);
+                    }
+                }
+                // Check if block is gone
+                if (ctx.world().getBlockState(placedShulkerPos).getBlock() instanceof AirBlock) {
+                    shulkerRestockState = ShulkerRestockState.COLLECT_SHULKER;
+                    shulkerRestockTicks = 0;
+                }
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+            }
+            case COLLECT_SHULKER: {
+                // Actively walk toward the dropped shulker item entity
+                BlockPos dropPos = findDroppedShulkerNear(placedShulkerPos);
+                if (dropPos == null) {
+                    // Give the item entity time to spawn on the client before concluding it's gone
+                    if (shulkerRestockTicks < 20) {
+                        return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                    }
+                    // Item entity is gone — either picked up or despawned
+                    shulkerRestockState = ShulkerRestockState.NONE;
+                    placedShulkerPos = null;
+                    neededBlock = null;
+                    logDirect("Shulker restock complete");
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                if (shulkerRestockTicks > 100) {
+                    logDirect("Shulker restock: timed out collecting dropped shulker");
+                    shulkerRestockState = ShulkerRestockState.NONE;
+                    placedShulkerPos = null;
+                    neededBlock = null;
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                // Path toward the item — GoalNear so we get within pickup range
+                return new PathingCommand(new GoalNear(dropPos, 0), PathingCommandType.REVALIDATE_GOAL_AND_PATH);
+            }
+            default:
+                shulkerRestockState = ShulkerRestockState.NONE;
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
     }
 
     private static boolean sameBlockstate(BlockState first, BlockState second) {

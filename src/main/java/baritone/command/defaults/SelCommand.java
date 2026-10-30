@@ -41,20 +41,30 @@ import baritone.api.utils.BetterBlockPos;
 import baritone.api.utils.BlockOptionalMeta;
 import baritone.api.utils.BlockOptionalMetaLookup;
 import baritone.api.utils.BlockUtils;
+import baritone.api.utils.SettingsUtil;
+import baritone.process.BuilderProcess;
 import baritone.utils.BlockStateInterface;
 import baritone.utils.IRenderer;
 import baritone.utils.schematic.StaticSchematic;
-import com.mojang.blaze3d.vertex.BufferBuilder;
+import baritone.utils.schematic.format.defaults.SpongeSchematic;
+import baritone.utils.IRenderer.LineBuffer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Vec3i;
+import net.minecraft.world.level.block.AirBlock;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
+import org.apache.commons.io.FilenameUtils;
 
 import java.awt.*;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.List;
 import java.util.function.Function;
@@ -63,6 +73,7 @@ import java.util.stream.Stream;
 
 public class SelCommand extends Command {
 
+    private static final DateTimeFormatter EXPORT_TIMESTAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
     private ISelectionManager manager = baritone.getSelectionManager();
     private BetterBlockPos pos1 = null;
     private ISchematic clipboard = null;
@@ -80,7 +91,7 @@ public class SelCommand extends Command {
                 float opacity = Baritone.settings().selectionOpacity.value;
                 float lineWidth = Baritone.settings().selectionLineWidth.value;
                 boolean ignoreDepth = Baritone.settings().renderSelectionIgnoreDepth.value;
-                BufferBuilder bufferBuilder = IRenderer.startLines(color, opacity);
+                LineBuffer bufferBuilder = IRenderer.startLines(color, opacity);
                 IRenderer.emitAABB(bufferBuilder, event.getModelViewStack(), new AABB(pos1), lineWidth);
                 IRenderer.endLines(bufferBuilder, ignoreDepth);
             }
@@ -194,6 +205,40 @@ public class SelCommand extends Command {
                     logDirect("Undid pos2");
                 }
             }
+        } else if (action == Action.SHULKERS) {
+            if (!args.hasAny()) {
+                Baritone.settings().selSearchShulkers.value = !Baritone.settings().selSearchShulkers.value;
+                SettingsUtil.save(Baritone.settings());
+                logDirect(String.format("Selection shulker search %s", Baritone.settings().selSearchShulkers.value ? "enabled" : "disabled"));
+                return;
+            }
+            String mode = args.getString().toLowerCase(Locale.US);
+            args.requireMax(0);
+            switch (mode) {
+                case "on":
+                case "true":
+                case "enable":
+                    Baritone.settings().selSearchShulkers.value = true;
+                    SettingsUtil.save(Baritone.settings());
+                    logDirect("Selection shulker search enabled");
+                    break;
+                case "off":
+                case "false":
+                case "disable":
+                    Baritone.settings().selSearchShulkers.value = false;
+                    SettingsUtil.save(Baritone.settings());
+                    logDirect("Selection shulker search disabled");
+                    break;
+                case "status":
+                    logDirect(String.format(
+                            "Selection shulker search: %s (delay=%d ticks)",
+                            Baritone.settings().selSearchShulkers.value ? "enabled" : "disabled",
+                            Baritone.settings().selShulkerSearchDelay.value
+                    ));
+                    break;
+                default:
+                    throw new CommandInvalidStateException("Usage: sel shulker [on|off|status]");
+            }
         } else if (action == Action.LIGHTAURA) {
             BlockOptionalMeta replaces = args.getDatatypeFor(ForBlockOptionalMeta.INSTANCE);
             BlockOptionalMeta type = args.getDatatypeFor(ForBlockOptionalMeta.INSTANCE);
@@ -277,7 +322,7 @@ public class SelCommand extends Command {
                 ISchematic schematic = create.apply(new FillSchematic(size.getX(), size.getY(), size.getZ(), type));
                 composite.put(schematic, min.x - origin.x, min.y - origin.y, min.z - origin.z);
             }
-            baritone.getBuilderProcess().build("Fill", composite, origin);
+            buildSelectionSchematic("Fill", composite, origin, true);
             logDirect("Filling now");
         } else if (action == Action.COPY) {
             BetterBlockPos playerPos = ctx.viewerPos();
@@ -287,34 +332,33 @@ public class SelCommand extends Command {
             if (selections.length < 1) {
                 throw new CommandInvalidStateException("No selections");
             }
-            BlockStateInterface bsi = new BlockStateInterface(ctx);
-            BetterBlockPos origin = selections[0].min();
-            CompositeSchematic composite = new CompositeSchematic(0, 0, 0);
-            for (ISelection selection : selections) {
-                BetterBlockPos min = selection.min();
-                origin = new BetterBlockPos(
-                        Math.min(origin.x, min.x),
-                        Math.min(origin.y, min.y),
-                        Math.min(origin.z, min.z)
-                );
-            }
-            for (ISelection selection : selections) {
-                Vec3i size = selection.size();
-                BetterBlockPos min = selection.min();
-                BlockState[][][] blockstates = new BlockState[size.getX()][size.getZ()][size.getY()];
-                for (int x = 0; x < size.getX(); x++) {
-                    for (int y = 0; y < size.getY(); y++) {
-                        for (int z = 0; z < size.getZ(); z++) {
-                            blockstates[x][z][y] = bsi.get0(min.x + x, min.y + y, min.z + z);
-                        }
-                    }
-                }
-                ISchematic schematic = new StaticSchematic(blockstates);
-                composite.put(schematic, min.x - origin.x, min.y - origin.y, min.z - origin.z);
-            }
-            clipboard = composite;
-            clipboardOffset = origin.subtract(pos);
+            CapturedSchematic captured = captureClipboard(selections);
+            clipboard = captured.schematic;
+            clipboardOffset = captured.origin.subtract(pos);
             logDirect("Selection copied");
+        } else if (action == Action.EXPORT) {
+            args.requireMax(1);
+            ISelection[] selections = manager.getSelections();
+            if (selections.length < 1) {
+                throw new CommandInvalidStateException("No selections");
+            }
+            CapturedSelection captured = captureSelections(selections);
+            File file = resolveSelectionExportFile(args.hasAny() ? args.getString() : null, captured.schematic);
+            try {
+                Files.createDirectories(file.getParentFile().toPath());
+                SpongeSchematic.write(captured.schematic, file, stripFileExtension(file.getName()));
+            } catch (IOException ex) {
+                throw new CommandInvalidStateException("Unable to export selection: " + ex.getMessage());
+            }
+            logDirect(String.format(
+                    "Exported selection to %s (%dx%dx%d). Build with: %sbuild %s",
+                    file.getName(),
+                    captured.schematic.widthX(),
+                    captured.schematic.heightY(),
+                    captured.schematic.lengthZ(),
+                    Baritone.settings().prefix.value,
+                    file.getName()
+            ));
         } else if (action == Action.PASTE) {
             BetterBlockPos playerPos = ctx.viewerPos();
             BetterBlockPos pos = args.hasAny() ? args.getDatatypePost(RelativeBlockPos.INSTANCE, playerPos) : playerPos;
@@ -322,8 +366,14 @@ public class SelCommand extends Command {
             if (clipboard == null) {
                 throw new CommandInvalidStateException("You need to copy a selection first");
             }
-            baritone.getBuilderProcess().build("Fill", clipboard, pos.offset(clipboardOffset));
-            logDirect("Building now");
+            Vec3i buildOrigin = pos.offset(clipboardOffset);
+            buildSelectionSchematic("Fill", clipboard, buildOrigin, false);
+            logDirect(String.format(
+                    "Building now at %s %s %s",
+                    buildOrigin.getX(),
+                    buildOrigin.getY(),
+                    buildOrigin.getZ()
+            ));
         } else if (action == Action.EXPAND || action == Action.CONTRACT || action == Action.SHIFT) {
             args.requireExactly(3);
             TransformTarget transformTarget = TransformTarget.getByName(args.getString());
@@ -372,6 +422,11 @@ public class SelCommand extends Command {
                                 .filter(name -> name.toLowerCase(Locale.US).startsWith(prefix))
                                 .sorted(String.CASE_INSENSITIVE_ORDER);
                     }
+                } else if (action == Action.SHULKERS && args.hasExactlyOne()) {
+                    String prefix = args.peekString().toLowerCase(Locale.US);
+                    return Stream.of("on", "off", "status")
+                            .filter(option -> option.startsWith(prefix))
+                            .sorted();
                 } else if (action.isFillAction()) {
                     if (args.hasExactlyOne() || action == Action.REPLACE) {
                         while (args.has(2)) {
@@ -436,6 +491,7 @@ public class SelCommand extends Command {
                 "> sel ranch - Save the current selections as a protected cowhunt ranch zone.",
                 "> sel unfarm - Remove the saved protected cowhunt farm zone.",
                 "> sel unranch - Remove the saved protected cowhunt ranch zone.",
+                "> sel shulker [on|off|status] - Toggle inventory shulker restocking for #sel builds.",
                 "> sel undo/u - Undo the last action (setting positions, creating selections, etc.)",
                 "> sel set/fill/s/f [block] - Completely fill all selections with a block.",
                 "> sel walls/w [block] - Fill in the walls of the selection with a specified block.",
@@ -448,6 +504,7 @@ public class SelCommand extends Command {
                 "> sel replace/r <blocks...> <with> - Replaces blocks with another block.",
                 "> sel lightaura/la <replace> <with> - Sparse flush lighting over a selected flat area to prevent mob spawns, with a need/have/short count.",
                 "> sel copy/cp <x> <y> <z> - Copy the selected area relative to the specified or your position.",
+                "> sel export/xp [name] - Export the selected area to schematics/<name>.schem, or auto-name it if omitted.",
                 "> sel paste/p <x> <y> <z> - Build the copied area relative to the specified or your position.",
                 "",
                 "> sel expand <target> <direction> <blocks> - Expand the targets.",
@@ -555,8 +612,122 @@ public class SelCommand extends Command {
         for (BlockPos pos : chosen) {
             composite.put(lightBlock, pos.getX() - origin.x, pos.getY() - origin.y, pos.getZ() - origin.z);
         }
-        baritone.getBuilderProcess().build("LightAura", composite, origin);
+        buildSelectionSchematic("LightAura", composite, origin, true);
         logDirect("Lighting now");
+    }
+
+    private void buildSelectionSchematic(String name, ISchematic schematic, Vec3i origin, boolean ignoreBlockedPositions) {
+        if (baritone.getBuilderProcess() instanceof BuilderProcess concrete) {
+            concrete.buildSelection(name, schematic, origin, Baritone.settings().selSearchShulkers.value, ignoreBlockedPositions);
+            return;
+        }
+        baritone.getBuilderProcess().build(name, schematic, origin);
+    }
+
+    private CapturedSchematic captureClipboard(ISelection[] selections) {
+        BlockStateInterface bsi = new BlockStateInterface(ctx);
+        BetterBlockPos origin = selections[0].min();
+        CompositeSchematic composite = new CompositeSchematic(0, 0, 0);
+        for (ISelection selection : selections) {
+            BetterBlockPos min = selection.min();
+            origin = new BetterBlockPos(
+                    Math.min(origin.x, min.x),
+                    Math.min(origin.y, min.y),
+                    Math.min(origin.z, min.z)
+            );
+        }
+        for (ISelection selection : selections) {
+            Vec3i size = selection.size();
+            BetterBlockPos min = selection.min();
+            BlockState[][][] blockstates = new BlockState[size.getX()][size.getZ()][size.getY()];
+            for (int x = 0; x < size.getX(); x++) {
+                for (int y = 0; y < size.getY(); y++) {
+                    for (int z = 0; z < size.getZ(); z++) {
+                        blockstates[x][z][y] = bsi.get0(min.x + x, min.y + y, min.z + z);
+                    }
+                }
+            }
+            composite.put(new StaticSchematic(blockstates), min.x - origin.x, min.y - origin.y, min.z - origin.z);
+        }
+        return new CapturedSchematic(origin, composite);
+    }
+
+    private CapturedSelection captureSelections(ISelection[] selections) {
+        BlockStateInterface bsi = new BlockStateInterface(ctx);
+        BetterBlockPos min = selections[0].min();
+        BetterBlockPos max = selections[0].max();
+        for (ISelection selection : selections) {
+            BetterBlockPos selectionMin = selection.min();
+            BetterBlockPos selectionMax = selection.max();
+            min = new BetterBlockPos(
+                    Math.min(min.x, selectionMin.x),
+                    Math.min(min.y, selectionMin.y),
+                    Math.min(min.z, selectionMin.z)
+            );
+            max = new BetterBlockPos(
+                    Math.max(max.x, selectionMax.x),
+                    Math.max(max.y, selectionMax.y),
+                    Math.max(max.z, selectionMax.z)
+            );
+        }
+        int sizeX = max.x - min.x + 1;
+        int sizeY = max.y - min.y + 1;
+        int sizeZ = max.z - min.z + 1;
+        BlockState[][][] blockstates = new BlockState[sizeX][sizeZ][sizeY];
+        BlockState air = Blocks.AIR.defaultBlockState();
+        for (int x = 0; x < sizeX; x++) {
+            for (int z = 0; z < sizeZ; z++) {
+                Arrays.fill(blockstates[x][z], air);
+            }
+        }
+        for (ISelection selection : selections) {
+            BetterBlockPos selectionMin = selection.min();
+            BetterBlockPos selectionMax = selection.max();
+            for (int x = selectionMin.x; x <= selectionMax.x; x++) {
+                for (int y = selectionMin.y; y <= selectionMax.y; y++) {
+                    for (int z = selectionMin.z; z <= selectionMax.z; z++) {
+                        blockstates[x - min.x][z - min.z][y - min.y] = bsi.get0(x, y, z);
+                    }
+                }
+            }
+        }
+        return new CapturedSelection(min, new StaticSchematic(blockstates));
+    }
+
+    private File resolveSelectionExportFile(String rawName, StaticSchematic schematic) {
+        File schematicsDir = new File(ctx.minecraft().gameDirectory, "schematics");
+        String requested = rawName == null || rawName.trim().isEmpty()
+                ? defaultSelectionExportName(schematic)
+                : rawName.trim();
+        String normalized = requested;
+        if (FilenameUtils.getExtension(normalized).isEmpty()) {
+            normalized += ".schem";
+        }
+        File candidate = new File(schematicsDir, normalized);
+        File parent = candidate.getParentFile();
+        String baseName = stripFileExtension(candidate.getName());
+        String extension = FilenameUtils.getExtension(candidate.getName());
+        int suffix = 2;
+        while (candidate.exists()) {
+            candidate = new File(parent, baseName + "-" + suffix + "." + extension);
+            suffix++;
+        }
+        return candidate;
+    }
+
+    private String defaultSelectionExportName(StaticSchematic schematic) {
+        return String.format(
+                "selection-%s-%dx%dx%d.schem",
+                EXPORT_TIMESTAMP.format(LocalDateTime.now()),
+                schematic.widthX(),
+                schematic.heightY(),
+                schematic.lengthZ()
+        );
+    }
+
+    private String stripFileExtension(String name) {
+        String extension = FilenameUtils.getExtension(name);
+        return extension.isEmpty() ? name : name.substring(0, name.length() - extension.length() - 1);
     }
 
     private boolean canPlaceLightAuraBlock(BlockPos pos, BlockState lightState) {
@@ -586,7 +757,9 @@ public class SelCommand extends Command {
         RANCH("ranch"),
         UNFARM("unfarm"),
         UNRANCH("unranch"),
+        SHULKERS("shulker", "shulkers"),
         UNDO("undo", "u"),
+        EXPORT("export", "xp"),
         SET("set", "fill", "s", "f"),
         WALLS("walls", "w"),
         SHELL("shell", "shl"),
@@ -673,6 +846,28 @@ public class SelCommand extends Command {
                 names.addAll(Arrays.asList(target.names));
             }
             return names.toArray(new String[0]);
+        }
+    }
+
+    private static final class CapturedSelection {
+
+        private final BetterBlockPos origin;
+        private final StaticSchematic schematic;
+
+        private CapturedSelection(BetterBlockPos origin, StaticSchematic schematic) {
+            this.origin = origin;
+            this.schematic = schematic;
+        }
+    }
+
+    private static final class CapturedSchematic {
+
+        private final BetterBlockPos origin;
+        private final ISchematic schematic;
+
+        private CapturedSchematic(BetterBlockPos origin, ISchematic schematic) {
+            this.origin = origin;
+            this.schematic = schematic;
         }
     }
 

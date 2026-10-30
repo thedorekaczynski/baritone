@@ -126,6 +126,24 @@ public class ElytraCommand extends Command {
                 logDirect("Overworld water dive-bomb landings " + (enabled ? "enabled" : "disabled"));
                 break;
             }
+            case "landwalk": {
+                final boolean enabled;
+                if (!args.hasAny()) {
+                    enabled = !Baritone.settings().elytraWalkToGoalOnLanding.value;
+                } else {
+                    final String mode = args.getString().toLowerCase();
+                    if (mode.equals("on") || mode.equals("true") || mode.equals("enable")) {
+                        enabled = true;
+                    } else if (mode.equals("off") || mode.equals("false") || mode.equals("disable")) {
+                        enabled = false;
+                    } else {
+                        throw new CommandInvalidStateException("Usage: elytra landwalk [on|off]");
+                    }
+                }
+                Baritone.settings().elytraWalkToGoalOnLanding.value = enabled;
+                logDirect("Ground handoff after elytra landing " + (enabled ? "enabled" : "disabled"));
+                break;
+            }
             default: {
                 throw new CommandInvalidStateException("Invalid action");
             }
@@ -228,9 +246,9 @@ public class ElytraCommand extends Command {
     public Stream<String> tabComplete(String label, IArgConsumer args) throws CommandException {
         TabCompleteHelper helper = new TabCompleteHelper();
         if (args.hasExactlyOne()) {
-            helper.append("reset", "repack", "supported", "waterdive");
+            helper.append("reset", "repack", "supported", "waterdive", "landwalk");
         }
-        if (args.hasExactly(2) && "waterdive".equals(args.peekString())) {
+        if (args.hasExactly(2) && ("waterdive".equals(args.peekString()) || "landwalk".equals(args.peekString()))) {
             helper.append("on", "off");
         }
         return helper.filterPrefix(args.getString()).stream();
@@ -250,6 +268,7 @@ public class ElytraCommand extends Command {
                 "> elytra - fly to the current goal",
                 "> elytra reset - Resets the state of the process, but will try to keep flying to the same goal.",
                 "> elytra repack - Queues all of the chunks in render distance to be given to the native library.",
+                "> elytra landwalk [on|off] - Toggle walking the final stretch after landing near the goal.",
                 "> elytra waterdive [on|off] - Toggle water dive-bomb landings near the goal in the overworld.",
                 "> elytra supported - Tells you if baritone ships a native library that is compatible with your PC."
         );

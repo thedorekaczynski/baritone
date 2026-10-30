@@ -117,6 +117,12 @@ public class MovementParkour extends Movement {
         for (int i = 2; i <= maxJump; i++) {
             int destX = x + xDiff * i;
             int destZ = z + zDiff * i;
+            int midX = destX - xDiff;
+            int midZ = destZ - zDiff;
+
+            if (i > 2 && !hasHeadroom(context, midX, y, midZ)) {
+                break;
+            }
 
             // check head/feet
             if (!MovementHelper.fullyPassable(context, destX, y + 1, destZ)) {
@@ -200,6 +206,17 @@ public class MovementParkour extends Movement {
         }
     }
 
+    private static boolean hasHeadroom(CalculationContext context, int x, int y, int z) {
+        return MovementHelper.fullyPassable(context, x, y + 1, z)
+                && MovementHelper.fullyPassable(context, x, y + 2, z);
+    }
+
+    private boolean hasHeadroom(int step) {
+        BetterBlockPos pos = src.relative(direction, step);
+        return MovementHelper.fullyPassable(ctx, pos.above())
+                && MovementHelper.fullyPassable(ctx, pos.above(2));
+    }
+
     private static boolean checkOvershootSafety(BlockStateInterface bsi, int x, int y, int z) {
         // we're going to walk into these two blocks after the landing of the parkour anyway, so make sure they aren't avoidWalkingInto
         return !MovementHelper.avoidWalkingInto(bsi.get0(x, y, z)) && !MovementHelper.avoidWalkingInto(bsi.get0(x, y + 1, z));
@@ -258,6 +275,11 @@ public class MovementParkour extends Movement {
             // we have fallen
             logDebug("sorry");
             return state.setStatus(MovementStatus.UNREACHABLE);
+        }
+        for (int step = 1; step <= dist; step++) {
+            if (!hasHeadroom(step)) {
+                return state.setStatus(MovementStatus.UNREACHABLE);
+            }
         }
         if (dist >= 4 || ascend) {
             state.setInput(Input.SPRINT, true);

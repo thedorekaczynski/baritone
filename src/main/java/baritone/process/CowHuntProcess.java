@@ -32,11 +32,12 @@ import baritone.utils.BaritoneProcessHelper;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.animal.cow.Cow;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.food.FoodData;
-import net.minecraft.world.item.AxeItem;
+import net.minecraft.tags.ItemTags;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ChunkPos;
@@ -267,12 +268,12 @@ public final class CowHuntProcess extends BaritoneProcessHelper implements ICowH
         }
         ctx.playerController().syncHeldItem();
         ctx.minecraft().gameMode.attack(ctx.player(), cow);
-        ctx.player().swing(InteractionHand.MAIN_HAND);
+        ctx.player().swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
     }
 
     private void selectWeapon() {
         if (baritone.getInventoryBehavior().throwaway(true, stack ->
-                stack.getItem() instanceof AxeItem
+                stack.is(ItemTags.AXES)
                         || stack.is(Items.NETHERITE_SWORD)
                         || stack.is(Items.DIAMOND_SWORD)
                         || stack.is(Items.IRON_SWORD)

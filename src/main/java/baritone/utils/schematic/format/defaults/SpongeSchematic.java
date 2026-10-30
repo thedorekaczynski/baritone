@@ -28,8 +28,15 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
+import net.minecraft.nbt.NbtIo;
 
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.regex.Matcher;
@@ -94,6 +101,47 @@ public final class SpongeSchematic extends StaticSchematic {
         }
     }
 
+    public static void write(StaticSchematic schematic, File file, String name) throws IOException {
+        try (OutputStream output = java.nio.file.Files.newOutputStream(file.toPath())) {
+            NbtIo.writeCompressed(serialize(schematic, name), output);
+        }
+    }
+
+    public static CompoundTag serialize(StaticSchematic schematic, String name) {
+        CompoundTag root = new CompoundTag();
+        root.putInt("Version", 2);
+        root.putInt("Width", schematic.widthX());
+        root.putInt("Height", schematic.heightY());
+        root.putInt("Length", schematic.lengthZ());
+
+        CompoundTag metadata = new CompoundTag();
+        metadata.putString("Name", name);
+        metadata.putString("Author", "Baritone");
+        root.put("Metadata", metadata);
+
+        LinkedHashMap<String, Integer> palette = new LinkedHashMap<>();
+        ByteArrayOutputStream blockData = new ByteArrayOutputStream();
+        for (int y = 0; y < schematic.heightY(); y++) {
+            for (int z = 0; z < schematic.lengthZ(); z++) {
+                for (int x = 0; x < schematic.widthX(); x++) {
+                    String serialized = SerializedBlockState.toString(schematic.getDirect(x, y, z));
+                    int index = palette.computeIfAbsent(serialized, ignored -> palette.size());
+                    byte[] encoded = new VarInt(index).serialize();
+                    blockData.write(encoded, 0, encoded.length);
+                }
+            }
+        }
+
+        CompoundTag paletteTag = new CompoundTag();
+        for (Map.Entry<String, Integer> entry : palette.entrySet()) {
+            paletteTag.putInt(entry.getKey(), entry.getValue());
+        }
+        root.put("Palette", paletteTag);
+        root.putInt("PaletteMax", palette.size());
+        root.putByteArray("BlockData", blockData.toByteArray());
+        return root;
+    }
+
     private static final class SerializedBlockState {
 
         private static final Pattern REGEX = Pattern.compile("(?<location>(\\w+:)?\\w+)(\\[(?<properties>(\\w+=\\w+,?)+)])?");
@@ -148,6 +196,27 @@ public final class SpongeSchematic extends StaticSchematic {
                 e.printStackTrace();
                 return null;
             }
+        }
+
+        private static String toString(BlockState state) {
+            Identifier identifier = BuiltInRegistries.BLOCK.getKey(state.getBlock());
+            if (identifier == null) {
+                identifier = Identifier.parse("minecraft:air");
+            }
+            Map<Property<?>, Comparable<?>> values = state.getValues().collect(java.util.stream.Collectors.toMap(Property.Value::property, Property.Value::value));
+            if (values.isEmpty()) {
+                return identifier.toString();
+            }
+            List<String> properties = values.entrySet().stream()
+                    .sorted(java.util.Comparator.comparing(entry -> entry.getKey().getName()))
+                    .map(entry -> entry.getKey().getName() + "=" + propertyValueToString(entry.getKey(), entry.getValue()))
+                    .toList();
+            return identifier + "[" + String.join(",", properties) + "]";
+        }
+
+        @SuppressWarnings({"rawtypes", "unchecked"})
+        private static String propertyValueToString(Property property, Comparable value) {
+            return property.getName(value);
         }
 
         private static <T extends Comparable<T>> BlockState setPropertyValue(BlockState state, Property<T> property, String value) {

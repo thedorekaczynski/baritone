@@ -1,0 +1,157 @@
+BUILDER HOPPER DEPENDENCY FIX — SCAFFOLD
+=========================================
+
+PROBLEM:
+  Builder places hopper at 738,63,-297 wanting facing=east (into chest).
+  Chest isn't placed yet. Hopper defaults to facing=down.
+  Builder sees wrong facing, breaks hopper. Repeats forever.
+
+ROOT CAUSE:
+  HopperBlock.FACING is set at placement time based on what block the click
+  targets. If the target block (chest) doesn't exist yet, hopper faces DOWN.
+  Builder has no concept of "place this block after that block."
+
+FIX SUMMARY:
+  Add a dependency check for hoppers. If a hopper wants to face into a block
+  that isn't placed correctly yet, skip it and work on other blocks first.
+  Fallback: if nothing else to do, place the hopper anyway.
+
+=========================================
+FILES TO MODIFY:
+=========================================
+
+1. src/main/java/baritone/process/BuilderProcess.java
+
+   ONLY file we touch. No settings changes, no API changes.
+
+=========================================
+CHANGES (4 pieces):
+=========================================
+
+PIECE 1: Add dependenciesMet() method
+--------------------------------------
+Location: Near the existing placementStateForDesired() method (~line 518)
+
+  private boolean dependenciesMet(BuilderCalculationContext bcc, int x, int y, int z, BlockState desired) {
+      if (!(desired.getBlock() instanceof HopperBlock)) {
+          return true;
+      }
+      Direction facing = desired.getValue(HopperBlock.FACING);
+      if (facing == Direction.DOWN) {
+          return true; // no horizontal dependency
+      }
+      // Check: does the block the hopper faces into exist yet?
+      int tx = x + facing.getStepX();
+      int ty = y + facing.getStepY();
+      int tz = z + facing.getStepZ();
+      BlockState targetCurrent = bcc.bsi.get0(tx, ty, tz);
+      // Target position must have a solid block (not air)
+      // We don't care if it matches schematic exactly — just that something is there
+      return !(targetCurrent.getBlock() instanceof AirBlock);
+  }
+
+WHY "not air" instead of "matches schematic":
+  If we check schematic match, a chest with wrong ChestType (single vs double)
+  would fail, and we'd deadlock. We just need ANY solid block there so the
+  hopper click targets it and gets the right facing.
+
+PIECE 2: Filter in searchForPlacables()
+----------------------------------------
+Location: Inside the dx/dy/dz loop, after the BetterBlockPos creation (~line 412)
+
+  Current code:
+      BetterBlockPos pos = new BetterBlockPos(x, y, z);
+      desirableOnHotbar.add(desired);
+      Optional<Placement> exact = possibleToPlace(desired, x, y, z, bcc.bsi);
+
+  Change to:
+      BetterBlockPos pos = new BetterBlockPos(x, y, z);
+      if (!dependenciesMet(bcc, x, y, z, desired)) {
+          continue; // skip — dependency not placed yet
+      }
+      desirableOnHotbar.add(desired);
+      Optional<Placement> exact = possibleToPlace(desired, x, y, z, bcc.bsi);
+
+  No fallback needed here. searchForPlacables is opportunistic — if it finds
+  nothing, the builder falls through to assemble() which handles pathing.
+
+PIECE 3: Filter in assemble() with fallback
+--------------------------------------------
+Location: Where incorrectPositions are sorted into placeable/breakable (~line 1621)
+
+  Current code (air branch):
+      if (containsBlockState(approxPlaceable, desired) || canSupplyApproxPlaceable(...)) {
+          placeable.add(pos);
+      }
+
+  Change to:
+      if (containsBlockState(approxPlaceable, desired) || canSupplyApproxPlaceable(...)) {
+          if (dependenciesMet(bcc, pos.x, pos.y, pos.z, desired)) {
+              placeable.add(pos);
+          } else {
+              deferredPlaceable.add(pos);
+          }
+      }
+
+  Same change in the liquid branch (~line 1639).
+
+  Add deferredPlaceable list declaration next to placeable:
+      List<BetterBlockPos> deferredPlaceable = new ArrayList<>();
+
+  DEADLOCK BREAKER (after incorrectPositions.forEach):
+      if (placeable.isEmpty() && breakable.isEmpty() && sourceLiquids.isEmpty() && !deferredPlaceable.isEmpty()) {
+          placeable.addAll(deferredPlaceable);
+          deferredPlaceable.clear();
+      }
+
+  This is the same pattern we tried before, but now it only defers HOPPERS
+  (not chests, not ladders), so deadlocks are far less likely. And if they
+  happen, the fallback catches them.
+
+PIECE 4: Don't break hoppers whose dependency isn't met (OPTIONAL)
+------------------------------------------------------------------
+Location: toBreakNearPlayer() or the incorrect position detection
+
+  This prevents the break-place churn for hoppers that were placed before
+  the fix was in effect. WITHOUT this, a wrong-facing hopper from a previous
+  session would still get broken and re-placed.
+
+  In the valid() method or in incorrectPositions scanning, we could add:
+    "If block is a hopper, and current.getBlock() == desired.getBlock(),
+     and dependenciesMet returns false, treat as temporarily valid."
+
+  But this is risky — it means hoppers with wrong facing are accepted as
+  "good enough" even if the chest IS there now. We'd need to re-check
+  when the target block appears.
+
+  RECOMMENDATION: Skip piece 4 for now. The break-place loop is broken by
+  pieces 2+3 (hopper won't be RE-placed until dependency is met). The only
+  scenario where piece 4 helps is resuming a build where hoppers were already
+  placed wrong — and in that case the builder will break+rePlace correctly
+  because the chests should already be there from the previous session.
+
+=========================================
+WHAT WE ARE NOT DOING:
+=========================================
+- No tier/priority system (overkill)
+- No changes to shouldDelayPlacement (doesn't exist in committed code)
+- No changes to ORIENTATION_PROPS (we already added HopperBlock.FACING)
+- No changes to Settings.java or any API
+- No changes to chest ordering (LEFT/RIGHT) — vanilla builder handles
+  double chests via placementStateForDesired converting to SINGLE
+- No changes to ladder/torch handling — canSurvive already handles those
+
+=========================================
+RISK ASSESSMENT:
+=========================================
+- dependenciesMet only affects HopperBlock — zero impact on other blocks
+- Fallback ensures no deadlock even if dependency can never be met
+- Single extra bsi.get0() call per hopper candidate per tick — negligible
+- If the check is wrong, worst case is hoppers get deferred one extra tick
+
+=========================================
+IMPORTS NEEDED:
+=========================================
+- Direction (already imported via net.minecraft.core.Direction)
+- HopperBlock (already covered by net.minecraft.world.level.block.*)
+- AirBlock (already covered by wildcard import)

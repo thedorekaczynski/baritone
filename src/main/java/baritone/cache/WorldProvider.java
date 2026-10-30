@@ -88,23 +88,19 @@ public class WorldProvider implements IWorldProvider {
         this.pendingWorld = null;
         this.currentProfile = null;
 
-        this.getSaveDirectories(world).ifPresent(dirs -> {
-            writeReadme(dirs.readmeDir);
-
-            if (dirs.singleplayer) {
-                openWorld(dirs.baseDirectory, world, null);
-                this.mcWorld = ctx.world();
-                return;
+        this.getSaveDirectories(world).ifPresent(directories -> {
+            writeReadme(directories.readmeDir);
+            if (directories.singleplayer) {
+                openWorld(directories.baseDirectory, world, null);
+            } else {
+                this.pendingWorld = new PendingWorldSession(directories, world);
+                this.pendingWorld.tryFinalize(false);
             }
-
-            this.pendingWorld = new PendingWorldSession(dirs, world);
-            this.pendingWorld.tryFinalize(false);
             this.mcWorld = ctx.world();
         });
     }
 
     public final void closeWorld() {
-        PendingWorldSession pending = this.pendingWorld;
         this.pendingWorld = null;
 
         if (this.currentProfile != null) {
@@ -134,14 +130,14 @@ public class WorldProvider implements IWorldProvider {
     }
 
     private void openWorld(Path root, Level world, ActiveProfile profile) {
-        final Path worldDataDir = this.getWorldDataDirectory(root, world);
+        Path worldDataDir = this.getWorldDataDirectory(root, world);
         try {
             Files.createDirectories(worldDataDir);
         } catch (IOException ignored) {}
 
         System.out.println("Baritone world data dir: " + worldDataDir);
         synchronized (worldCache) {
-            this.currentWorld = worldCache.computeIfAbsent(worldDataDir, d -> new WorldData(d, world.dimensionType(), world.dimension()));
+            this.currentWorld = worldCache.computeIfAbsent(worldDataDir, directory -> new WorldData(directory, world.dimensionType(), world.dimension()));
         }
         this.currentProfile = profile;
         this.mcWorld = ctx.world();
@@ -166,20 +162,18 @@ public class WorldProvider implements IWorldProvider {
     private Optional<SaveDirectories> getSaveDirectories(Level world) {
         if (ctx.minecraft().hasSingleplayerServer()) {
             Path worldDir = ctx.minecraft().getSingleplayerServer().getWorldPath(LevelResource.ROOT);
-
             if (worldDir.relativize(ctx.minecraft().gameDirectory.toPath()).getNameCount() != 2) {
                 worldDir = worldDir.getParent();
             }
-
             worldDir = worldDir.resolve("baritone");
             return Optional.of(new SaveDirectories(worldDir, worldDir, null, null, true));
         }
 
-        final ServerData serverData = ctx.minecraft().getCurrentServer();
+        ServerData serverData = ctx.minecraft().getCurrentServer();
         if (serverData == null) {
             System.out.println("World seems to be a replay. Not loading Baritone cache.");
-            currentWorld = null;
-            mcWorld = ctx.world();
+            this.currentWorld = null;
+            this.mcWorld = ctx.world();
             return Optional.empty();
         }
 
@@ -188,11 +182,12 @@ public class WorldProvider implements IWorldProvider {
         if (SystemUtils.IS_OS_WINDOWS) {
             legacyFolderName = legacyFolderName.replace(":", "_");
         }
+
         String serverKey = normalizeServerKey(rawServerName);
-        Path serverRoot = baritone.getDirectory().resolve("servers").resolve(serverKey);
+        Path serverRoot = this.baritone.getDirectory().resolve("servers").resolve(serverKey);
         Path profilesDir = serverRoot.resolve("profiles");
-        Path legacyRoot = baritone.getDirectory().resolve(legacyFolderName);
-        return Optional.of(new SaveDirectories(serverRoot, baritone.getDirectory(), profilesDir, legacyRoot, false));
+        Path legacyRoot = this.baritone.getDirectory().resolve(legacyFolderName);
+        return Optional.of(new SaveDirectories(serverRoot, this.baritone.getDirectory(), profilesDir, legacyRoot, false));
     }
 
     private static String normalizeServerKey(String raw) {
@@ -208,23 +203,23 @@ public class WorldProvider implements IWorldProvider {
         return out.length() == 0 ? "unknown" : out.toString();
     }
 
-    private List<ProfileCandidate> loadCandidates(SaveDirectories dirs) {
-        List<ProfileCandidate> out = new ArrayList<>();
+    private List<ProfileCandidate> loadCandidates(SaveDirectories directories) {
+        List<ProfileCandidate> candidates = new ArrayList<>();
 
-        if (dirs.profilesDirectory != null && Files.isDirectory(dirs.profilesDirectory)) {
-            try (Stream<Path> stream = Files.list(dirs.profilesDirectory)) {
+        if (directories.profilesDirectory != null && Files.isDirectory(directories.profilesDirectory)) {
+            try (Stream<Path> stream = Files.list(directories.profilesDirectory)) {
                 stream.filter(Files::isDirectory)
                         .sorted()
-                        .forEach(path -> out.add(new ProfileCandidate(path, false)));
+                        .forEach(path -> candidates.add(new ProfileCandidate(path, false)));
             } catch (IOException ignored) {}
         }
 
-        if (dirs.legacyRoot != null && Files.isDirectory(dirs.legacyRoot)) {
-            out.add(new ProfileCandidate(dirs.legacyRoot, true));
+        if (directories.legacyRoot != null && Files.isDirectory(directories.legacyRoot)) {
+            candidates.add(new ProfileCandidate(directories.legacyRoot, true));
         }
 
-        out.sort(Comparator.comparingLong((ProfileCandidate c) -> c.lastSeenAt()).reversed());
-        return out;
+        candidates.sort(Comparator.comparingLong((ProfileCandidate candidate) -> candidate.lastSeenAt()).reversed());
+        return candidates;
     }
 
     /**
@@ -240,11 +235,18 @@ public class WorldProvider implements IWorldProvider {
                 System.out.println("mc.world loaded unnoticed! Loading Baritone cache now.");
                 initWorld(ctx.world());
             }
-        } else if (this.currentWorld == null && this.pendingWorld == null && ctx.world() != null
+            return;
+        }
+
+        if (this.currentWorld == null && this.pendingWorld == null && ctx.world() != null
                 && (ctx.minecraft().hasSingleplayerServer() || ctx.minecraft().getCurrentServer() != null)) {
             System.out.println("Retrying to load Baritone cache");
             initWorld(ctx.world());
         }
+    }
+
+    private BetterBlockPos currentPlayerPos() {
+        return ctx.player() == null ? null : ctx.playerFeet();
     }
 
     private final class ActiveProfile {
@@ -261,13 +263,13 @@ public class WorldProvider implements IWorldProvider {
         }
 
         private void observeChunk(LevelChunk chunk) {
-            String key = WorldFingerprint.chunkKey(chunk);
-            if (this.sessionFingerprints.containsKey(key)) {
+            String chunkKey = WorldFingerprint.chunkKey(chunk);
+            if (this.sessionFingerprints.containsKey(chunkKey)) {
                 return;
             }
             String fingerprint = WorldFingerprint.fingerprint(chunk);
-            this.sessionFingerprints.put(key, fingerprint);
-            this.metadata.recordChunkFingerprint(key, fingerprint);
+            this.sessionFingerprints.put(chunkKey, fingerprint);
+            this.metadata.recordChunkFingerprint(chunkKey, fingerprint);
         }
 
         private void onClose() {
@@ -291,13 +293,13 @@ public class WorldProvider implements IWorldProvider {
             this.directories = directories;
             this.world = world;
             this.candidates = loadCandidates(directories);
-            this.provisionalCandidate = this.candidates.isEmpty() ? null : this.candidates.get(0);
+            this.provisionalCandidate = this.candidates.isEmpty() ? null : this.candidates.getFirst();
         }
 
         private void observeChunk(LevelChunk chunk) {
-            String key = WorldFingerprint.chunkKey(chunk);
-            if (!this.observedFingerprints.containsKey(key)) {
-                this.observedFingerprints.put(key, WorldFingerprint.fingerprint(chunk));
+            String chunkKey = WorldFingerprint.chunkKey(chunk);
+            if (!this.observedFingerprints.containsKey(chunkKey)) {
+                this.observedFingerprints.put(chunkKey, WorldFingerprint.fingerprint(chunk));
                 this.observedChunkPositions.add(new int[]{chunk.getPos().x(), chunk.getPos().z()});
             }
             tryFinalize(false);
@@ -307,6 +309,7 @@ public class WorldProvider implements IWorldProvider {
             if (pendingWorld != this || currentWorld != null) {
                 return;
             }
+
             ProfileCandidate chosen = selectCandidate(force);
             if (chosen == null) {
                 return;
@@ -345,7 +348,7 @@ public class WorldProvider implements IWorldProvider {
             }
 
             if (this.candidates.size() == 1 && this.observedFingerprints.isEmpty()) {
-                return this.candidates.get(0);
+                return this.candidates.getFirst();
             }
 
             List<CandidateScore> scores = new ArrayList<>();
@@ -353,11 +356,11 @@ public class WorldProvider implements IWorldProvider {
                 scores.add(score(candidate));
             }
             scores.sort(Comparator
-                    .comparingInt((CandidateScore s) -> s.score).reversed()
-                    .thenComparingInt(s -> s.chunkMatches).reversed()
-                    .thenComparingLong(s -> s.candidate.lastSeenAt()).reversed());
+                    .comparingInt((CandidateScore score) -> score.score).reversed()
+                    .thenComparing(Comparator.comparingInt((CandidateScore score) -> score.chunkMatches).reversed())
+                    .thenComparing(Comparator.comparingLong((CandidateScore score) -> score.candidate.lastSeenAt()).reversed()));
 
-            CandidateScore best = scores.get(0);
+            CandidateScore best = scores.getFirst();
             CandidateScore provisional = findScore(scores, this.provisionalCandidate);
 
             if (best.chunkMatches > 0 && best.chunkMismatches == 0) {
@@ -438,12 +441,9 @@ public class WorldProvider implements IWorldProvider {
         private ProfileCandidate createNewCandidate() {
             String profileId = "profile-" + UUID.randomUUID().toString().substring(0, 8);
             Path root = this.directories.profilesDirectory.resolve(profileId);
-            return new ProfileCandidate(root, false, WorldProfileMetadata.create(profileId, WorldFingerprint.dimensionKey(this.world), currentPlayerPos()));
+            WorldProfileMetadata metadata = WorldProfileMetadata.create(profileId, WorldFingerprint.dimensionKey(this.world), currentPlayerPos());
+            return new ProfileCandidate(root, false, metadata);
         }
-    }
-
-    private BetterBlockPos currentPlayerPos() {
-        return ctx.player() == null ? null : ctx.playerFeet();
     }
 
     private static final class SaveDirectories {
